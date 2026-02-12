@@ -65,13 +65,15 @@ internal class SelectFilterOption(val name: String, val value: String)
 
 internal class ContentRatingFilter(
     defaultRatings: Set<String>,
-    ratings: List<FilterData> = CONTENT_RATINGS.map { FilterData(it, it.replaceFirstChar { c -> c.uppercase() }) },
+    ratings: List<FilterData> = CONTENT_RATINGS.map {
+        FilterData(it.replaceFirstChar { c -> c.uppercase() }, it.replaceFirstChar { c -> c.uppercase() })
+    },
 ) : JsonMultiSelectFilter(
     "Content Rating",
     "content_rating",
     ratings.map {
         MultiSelectOption(it.name, it.id).apply {
-            state = defaultRatings.contains(it.id)
+            state = defaultRatings.contains(it.id.lowercase())
         }
     },
 )

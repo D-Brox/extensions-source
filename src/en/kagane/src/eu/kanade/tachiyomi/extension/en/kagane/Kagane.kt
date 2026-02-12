@@ -17,7 +17,6 @@ import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
-import eu.kanade.tachiyomi.extension.en.kagane.ChapterDto.Companion.dateFormat
 import eu.kanade.tachiyomi.extension.en.kagane.wv.Cdm
 import eu.kanade.tachiyomi.extension.en.kagane.wv.ProtectionSystemHeaderBox
 import eu.kanade.tachiyomi.extension.en.kagane.wv.parsePssh
@@ -35,7 +34,6 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
-import keiyoushi.utils.tryParse
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.buildJsonObject
@@ -66,7 +64,7 @@ class Kagane : HttpSource(), ConfigurableSource {
     override val name = "Kagane"
 
     private val domain = "kagane.org"
-    private val apiUrl = "https://api.$domain"
+    private val apiUrl = "https://yuzuki.$domain"
     override val baseUrl = "https://$domain"
 
     override val lang = "en"
@@ -158,6 +156,9 @@ class Kagane : HttpSource(), ConfigurableSource {
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val body = buildJsonObject {
+            if (query.isNotBlank()) {
+                put("title", query)
+            }
             filters.forEach { filter ->
                 when (filter) {
                     is GenresFilter -> {
@@ -173,12 +174,9 @@ class Kagane : HttpSource(), ConfigurableSource {
             .toJsonString()
             .toRequestBody("application/json".toMediaType())
 
-        val url = "$apiUrl/api/v1/search".toHttpUrl().newBuilder().apply {
+        val url = "$apiUrl/api/v2/search/series".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", (page - 1).toString())
             addQueryParameter("size", 35.toString()) // Default items per request
-            if (query.isNotBlank()) {
-                addQueryParameter("name", query)
-            }
             filters.forEach { filter ->
                 when (filter) {
                     is SortFilter -> {
@@ -204,20 +202,20 @@ class Kagane : HttpSource(), ConfigurableSource {
         val dto = response.parseAs<SearchDto>()
         val mangas = dto.content.filter {
             if (!preferences.showDuplicates) {
-                val alternateSeries = client.newCall(GET("$apiUrl/api/v1/alternate_series/${it.id}", apiHeaders))
+                val alternateSeries = client.newCall(GET("$apiUrl/api/v2/alternate_series/${it.id}", apiHeaders))
                     .execute()
                     .parseAs<List<AlternateSeries>>()
 
                 if (alternateSeries.isEmpty()) return@filter true
 
-                val date = dateFormat.tryParse(it.releaseDate)
+                val startYear = it.startYear ?: 0
                 for (alt in alternateSeries) {
-                    val altDate = dateFormat.tryParse(alt.releaseDate)
+                    val altYear = alt.startYear ?: 0
 
                     when {
                         it.booksCount < alt.booksCount -> return@filter false
                         it.booksCount == alt.booksCount -> {
-                            if (date > altDate) return@filter false
+                            if (startYear < altYear) return@filter false
                         }
                     }
                 }
@@ -241,7 +239,7 @@ class Kagane : HttpSource(), ConfigurableSource {
     }
 
     private fun mangaDetailsRequest(seriesId: String): Request {
-        return GET("$apiUrl/api/v1/series/$seriesId", apiHeaders)
+        return GET("$apiUrl/api/v2/series/$seriesId", apiHeaders)
     }
 
     override fun getMangaUrl(manga: SManga): String {
@@ -256,24 +254,30 @@ class Kagane : HttpSource(), ConfigurableSource {
 
         val dto = response.parseAs<ChapterDto>()
 
-        val source = runCatching {
+        val format = runCatching {
             client.newCall(mangaDetailsRequest(seriesId))
                 .execute()
                 .parseAs<DetailsDto>()
-                .source
+                .format
         }.getOrDefault("")
-        val useSourceChapterNumber = source in setOf(
+
+        val useSourceChapterNumber = format in setOf(
             "Dark Horse Comics",
             "Flame Comics",
             "MangaDex",
             "Square Enix Manga",
         )
 
-        return dto.content.map { it -> it.toSChapter(useSourceChapterNumber) }.reversed()
+        return dto.seriesBooks.map { book ->
+            book.toSChapter(useSourceChapterNumber).apply {
+                // Fix the URL to include the actual seriesId
+                url = "$seriesId;${book.id};${book.pagesCount}"
+            }
+        }.reversed()
     }
 
     override fun chapterListRequest(manga: SManga): Request {
-        return GET("$apiUrl/api/v1/books/${manga.url}", apiHeaders)
+        return GET("$apiUrl/api/v2/books/${manga.url}", apiHeaders)
     }
 
     // =============================== Pages ================================
@@ -289,29 +293,24 @@ class Kagane : HttpSource(), ConfigurableSource {
             .toBase64()
     }
 
-    private val windvineCertificate by lazy { getCertificate("$apiUrl/api/v1/static/bin.bin") }
+    private val windvineCertificate by lazy { getCertificate("$apiUrl/api/v2/static/bin.bin") }
 
-    private val fairPlayCertificate by lazy { getCertificate("$apiUrl/api/v1/static/crt.crt") }
+    private val fairPlayCertificate by lazy { getCertificate("$apiUrl/api/v2/static/crt.crt") }
 
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> {
         if (chapter.url.count { it == ';' } != 2) throw Exception("Chapter url error, please refresh chapter list.")
-        var (seriesId, chapterId, pageCount) = chapter.url.split(";")
+        val (seriesId, chapterId, pageCount) = chapter.url.split(";")
 
         val challengeResp = getChallengeResponse(seriesId, chapterId)
         accessToken = challengeResp.accessToken
         cacheUrl = challengeResp.cacheUrl
-        if (preferences.dataSaver) {
-            chapterId = chapterId + "_ds"
-        }
 
         val pages = (0 until pageCount.toInt()).map { page ->
-            val pageUrl = "$cacheUrl/api/v1/books".toHttpUrl().newBuilder().apply {
-                addPathSegment(seriesId)
-                addPathSegment("file")
+            val pageUrl = "$cacheUrl/api/v2/books/file".toHttpUrl().newBuilder().apply {
                 addPathSegment(chapterId)
                 addPathSegment(challengeResp.pageMapping.getValue(page + 1))
                 addQueryParameter("token", accessToken)
-                addQueryParameter("index", (page + 1).toString())
+                addQueryParameter("is_datasaver", preferences.dataSaver.toString())
             }.build().toString()
 
             Page(page, imageUrl = pageUrl)
@@ -320,7 +319,7 @@ class Kagane : HttpSource(), ConfigurableSource {
         return Observable.just(pages)
     }
 
-    private var cacheUrl = "https://yukine.$domain"
+    private var cacheUrl = "https://akari.$domain"
     private var accessToken: String = ""
 
     @SuppressLint("SetJavaScriptEnabled")
@@ -334,7 +333,7 @@ class Kagane : HttpSource(), ConfigurableSource {
         }
 
         val challengeUrl =
-            "$apiUrl/api/v1/books/$seriesId/file/$chapterId".toHttpUrl().newBuilder().apply {
+            "$apiUrl/api/v2/books/$seriesId/file/$chapterId".toHttpUrl().newBuilder().apply {
                 if (preferences.dataSaver) {
                     addQueryParameter("datasaver", true.toString())
                 }
@@ -669,13 +668,13 @@ class Kagane : HttpSource(), ConfigurableSource {
         )
 
         val response = metadataClient.newCall(
-            GET("$apiUrl/api/v1/metadata", apiHeaders, CacheControl.FORCE_CACHE),
+            GET("$apiUrl/api/v2/metadata", apiHeaders, CacheControl.FORCE_CACHE),
         ).await()
 
         // the cache only request fails if it was not cached already
         if (!response.isSuccessful) {
             metadataClient.newCall(
-                GET("$apiUrl/api/v1/metadata", apiHeaders, CacheControl.FORCE_NETWORK),
+                GET("$apiUrl/api/v2/metadata", apiHeaders, CacheControl.FORCE_NETWORK),
             ).enqueue(
                 object : Callback {
                     override fun onResponse(call: Call, response: Response) {
