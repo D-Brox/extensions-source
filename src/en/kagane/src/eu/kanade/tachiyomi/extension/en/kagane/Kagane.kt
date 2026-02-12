@@ -252,16 +252,9 @@ class Kagane : HttpSource(), ConfigurableSource {
         val seriesId = response.request.url.toString()
             .substringAfterLast("/")
 
-        val dto = response.parseAs<ChapterDto>()
+        val dto = response.parseAs<DetailsDto>()
 
-        val format = runCatching {
-            client.newCall(mangaDetailsRequest(seriesId))
-                .execute()
-                .parseAs<DetailsDto>()
-                .format
-        }.getOrDefault("")
-
-        val useSourceChapterNumber = format in setOf(
+        val useSourceChapterNumber = dto.format in setOf(
             "Dark Horse Comics",
             "Flame Comics",
             "MangaDex",
@@ -277,7 +270,7 @@ class Kagane : HttpSource(), ConfigurableSource {
     }
 
     override fun chapterListRequest(manga: SManga): Request {
-        return GET("$apiUrl/api/v2/books/${manga.url}", apiHeaders)
+        return GET("$apiUrl/api/v2/series/${manga.url}", apiHeaders)
     }
 
     // =============================== Pages ================================

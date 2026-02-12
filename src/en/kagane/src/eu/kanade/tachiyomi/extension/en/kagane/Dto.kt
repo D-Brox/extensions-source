@@ -69,11 +69,12 @@ class DetailsDto(
     val tags: List<Tag> = emptyList(),
     @SerialName("series_alternate_titles")
     val seriesAlternateTitles: List<AlternateTitle> = emptyList(),
+    @SerialName("series_books")
+    val seriesBooks: List<ChapterDto.Book> = emptyList(),
 ) {
     @Serializable
     class SeriesStaff(
-        @SerialName("staff_name")
-        val staffName: String,
+        val name: String,
         val role: String,
     )
 
@@ -118,7 +119,7 @@ class DetailsDto(
             it.role.contains("Story", ignoreCase = true) ||
             it.role.contains("Art", ignoreCase = true) ||
             it.role.contains("Artist", ignoreCase = true)
-        }.map { it.staffName }.distinct()
+        }.map { it.name }.distinct()
 
         author = authors.joinToString()
         description = desc.toString().trim()
