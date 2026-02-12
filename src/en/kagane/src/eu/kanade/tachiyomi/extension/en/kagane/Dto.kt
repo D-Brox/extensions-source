@@ -10,8 +10,8 @@ import java.util.Locale
 
 @Serializable
 class SearchDto(
-    val content: List<Book>,
-    val last: Boolean,
+    val content: List<Book> = emptyList(),
+    val last: Boolean = true,
     @SerialName("total_elements")
     val totalElements: Int = 0,
     @SerialName("total_pages")
