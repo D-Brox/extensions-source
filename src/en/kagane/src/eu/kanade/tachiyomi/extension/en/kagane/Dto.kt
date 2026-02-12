@@ -123,7 +123,7 @@ class DetailsDto(
 
         author = authors.joinToString()
         description = desc.toString().trim()
-        genre = genres.map { it.genreName }.joinToString()
+        genre = genres.joinToString { it.genreName }
         status = this@DetailsDto.publicationStatus.toStatus()
     }
 
@@ -165,10 +165,22 @@ class ChapterDto(
             // series_id might be null in the books endpoint, so we extract it from the request URL later
             val actualSeriesId = seriesId ?: "unknown"
             url = "$actualSeriesId;$id;$pagesCount"
-            name = title
+            name = buildChapterName()
             date_upload = dateFormat.tryParse(createdAt)
             if (useSourceChapterNumber) {
                 chapter_number = number
+            }
+        }
+
+        private fun buildChapterName(): String {
+            return if (!chapterNo.isNullOrBlank()) {
+                if (title.isNotBlank()) {
+                    "Chapter $chapterNo: $title"
+                } else {
+                    "Chapter $chapterNo"
+                }
+            } else {
+                title
             }
         }
     }
