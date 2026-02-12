@@ -96,21 +96,22 @@ class DetailsDto(
         val label: String?,
     )
 
-    fun toSManga(): SManga = SManga.create().apply {
+    fun toSManga(sourceName: String? = null): SManga = SManga.create().apply {
         val desc = StringBuilder()
-        if (!description.isNullOrBlank()) desc.append(description + "\n\n")
 
-        if (format != null) {
-            desc.append("Format: ").append(format).append("\n\n")
+        // Add main description
+        this@DetailsDto.description?.takeIf { it.isNotBlank() }?.let {
+            desc.append(it.trim())
+            desc.append("\n")
         }
 
+        // Add alternate titles at the end
         if (seriesAlternateTitles.isNotEmpty()) {
-            desc.append("Alternative Titles:\n")
+            if (desc.isNotEmpty()) desc.append("\n")
+            desc.append("Associated Name(s):\n")
             seriesAlternateTitles.forEach {
-                val label = if (it.label != null) " [${it.label}]" else ""
-                desc.append("• ${it.title}$label\n")
+                desc.append("• ${it.title}\n")
             }
-            desc.append("\n")
         }
 
         // Extract authors from staff (roles like "Author", "Artist", "Story", "Art")
