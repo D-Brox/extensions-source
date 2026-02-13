@@ -8,10 +8,14 @@ import android.os.Looper
 import android.util.Base64
 import android.util.Log
 import android.view.View
+import android.view.ViewGroup
+import android.webkit.CookieManager
 import android.webkit.JavascriptInterface
 import android.webkit.PermissionRequest
 import android.webkit.WebChromeClient
+import android.webkit.WebSettings
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
@@ -84,6 +88,29 @@ class Kagane :
             if (index >= 0) interceptors().add(networkInterceptors().removeAt(index))
         }
         .build()
+
+    val genres by lazy {
+        client.newCall(GET("$apiUrl/api/v2/genres/list")).execute().parseAs<List<GenreDto>>().associate { it.id to it.genreName }
+    }
+
+    val tags by lazy {
+        client.newCall(GET("$apiUrl/api/v2/tags/list")).execute().parseAs<List<TagDto>>().associate { it.id to it.tagName }
+    }
+    val sourcesInfo by lazy {
+        client.newCall(
+            POST(
+                "$apiUrl/api/v2/sources/list",
+                body = buildJsonObject { put("source_types", null) }.toJsonString().toRequestBody("application/json".toMediaType()),
+            ),
+        ).execute().parseAs<SourcesDto>().sources.associate { it.sourceId to (it.title to it.sourceType) }
+    }
+
+    val sources by lazy {
+        sourcesInfo.map { (k, v) -> k to v.first }.toMap()
+    }
+    val officialSources by lazy {
+        sourcesInfo.filter { it.value.second == "Official" }.toMap()
+    }
 
     private fun refreshTokenInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -161,7 +188,15 @@ class Kagane :
             filters.forEach { filter ->
                 when (filter) {
                     is GenresFilter -> {
-                        filter.addToJsonObject(this, preferences.excludedGenres.toList())
+                        filter.addToJsonObject(this, "genres", preferences.excludedGenres.toList())
+                    }
+
+                    is TagsFilter -> {
+                        filter.addToJsonObject(this, "genres")
+                    }
+
+                    is SourcesFilter -> {
+                        filter.addToJsonObject(this, "source_id")
                     }
 
                     is JsonFilter -> {
@@ -225,7 +260,7 @@ class Kagane :
             } else {
                 true
             }
-        }.map { it.toSManga(apiUrl, preferences.showSource) }
+        }.map { it.toSManga(apiUrl, preferences.showSource, sources) }
         return MangasPage(mangas, hasNextPage = dto.hasNextPage())
     }
 
@@ -309,6 +344,24 @@ class Kagane :
 
     private var cacheUrl = "https://akari.$domain"
     private var accessToken: String = ""
+    private var integrityToken: String = ""
+    private var integrityExp = System.currentTimeMillis()
+
+    private fun getIntegrityToken(): String {
+        if (integrityExp < System.currentTimeMillis()) {
+            val res = metadataClient.newCall(
+                POST(
+                    "https://kagane.org/api/integrity",
+                    headers,
+                    body = "".toRequestBody("application/json".toMediaType()),
+                ),
+            ).execute().parseAs<IntegrityDto>()
+            integrityToken = res.token
+            integrityExp = res.exp * 1000
+        }
+
+        return integrityToken
+    }
 
     @SuppressLint("SetJavaScriptEnabled")
     private fun getChallengeResponse(chapterId: String): ChallengeDto {
@@ -324,6 +377,7 @@ class Kagane :
             return challenge.parseAs<ChallengeDto>()
         }
 
+        val integrityToken = getIntegrityToken()
         val f = ":$chapterId".sha256().sliceArray(0 until 16)
 
         val challenge = if (preferences.wvd.isNotBlank()) {
@@ -340,7 +394,9 @@ class Kagane :
             put("challenge", challenge)
         }.toJsonString().toRequestBody("application/json".toMediaType())
 
-        return client.newCall(POST(challengeUrl.toString(), apiHeaders, challengeBody)).execute()
+        val headers = apiHeaders.newBuilder().add("x-integrity-token", integrityToken).build()
+
+        return client.newCall(POST(challengeUrl.toString(), headers, challengeBody)).execute()
             .parseAs<ChallengeDto>()
     }
 
@@ -673,50 +729,7 @@ class Kagane :
             Filter.Separator(),
         )
 
-        val response = metadataClient.newCall(
-            GET("$apiUrl/api/v2/metadata", apiHeaders, CacheControl.FORCE_CACHE),
-        ).await()
-
-        // the cache only request fails if it was not cached already
-        if (!response.isSuccessful) {
-            metadataClient.newCall(
-                GET("$apiUrl/api/v2/metadata", apiHeaders, CacheControl.FORCE_NETWORK),
-            ).enqueue(
-                object : Callback {
-                    override fun onResponse(call: Call, response: Response) {
-                        response.closeQuietly()
-                    }
-                    override fun onFailure(call: Call, e: IOException) {
-                        Log.e(name, "Failed to fetch filters", e)
-                    }
-                },
-            )
-
-            filters.addAll(
-                index = 0,
-                listOf(
-                    Filter.Header("Press 'Reset' to load more filters"),
-                    Filter.Separator(),
-                ),
-            )
-
-            return@runBlocking FilterList(filters)
-        }
-
-        val metadata = try {
-            response.parseAs<MetadataDto>()
-        } catch (e: Throwable) {
-            Log.e(name, "Unable to parse filters", e)
-
-            filters.addAll(
-                index = 0,
-                listOf(
-                    Filter.Header("Failed to parse additional filters"),
-                    Filter.Separator(),
-                ),
-            )
-            return@runBlocking FilterList(filters)
-        }
+        val metadata = MetadataDto(genres, tags, sources)
 
         filters.addAll(
             index = 2,

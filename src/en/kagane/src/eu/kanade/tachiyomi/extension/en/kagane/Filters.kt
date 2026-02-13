@@ -11,17 +11,17 @@ import kotlinx.serialization.json.putJsonObject
 
 @Serializable
 data class MetadataDto(
-    val genres: List<MetadataTagDto>,
-    val tags: List<MetadataTagDto>,
-    val sources: List<MetadataTagDto>,
+    val genres: Map<String, String>,
+    val tags: Map<String, String>,
+    val sources: Map<String, String>,
 ) {
     fun getGenresList() = genres
-        .map { FilterData(it.name, it.name) }
-    fun getTagsList() = tags.sortedByDescending { it.count }
-        .slice(0..200)
-        .map { FilterData(it.name, it.name.replaceFirstChar { c -> c.uppercase() }) }
+        .map { (k, v) -> FilterData(k, v) }
+
+    fun getTagsList() = tags
+        .map { (k, v) -> FilterData(k, v.replaceFirstChar { c -> c.uppercase() }) }
     fun getSourcesList() = sources
-        .map { FilterData(it.name, it.name) }
+        .map { (k, v) -> FilterData(k, v) }
 }
 
 @Serializable
@@ -121,12 +121,25 @@ internal open class JsonMultiSelectFilter(
     genres: List<MultiSelectOption>,
 ) : Filter.Group<MultiSelectOption>(name, genres),
     JsonFilter {
-    override fun addToJsonObject(builder: JsonObjectBuilder, additionExcludeList: List<String>) {
+    override fun addToJsonObject(
+        builder: JsonObjectBuilder,
+        key: String,
+        additionExcludeList: List<String>,
+    ) {
         val whatToInclude = state.filter { it.state }.map { it.id }
-
-        if (whatToInclude.isNotEmpty()) {
-            builder.putJsonArray(param) {
-                whatToInclude.forEach { add(it) }
+        with(builder) {
+            if (whatToInclude.isNotEmpty()) {
+                if (key.isEmpty()) {
+                    putJsonArray(param) {
+                        whatToInclude.forEach { add(it) }
+                    }
+                } else {
+                    putJsonObject(key) {
+                        putJsonArray(param) {
+                            whatToInclude.forEach { add(it) }
+                        }
+                    }
+                }
             }
         }
     }
@@ -140,25 +153,29 @@ internal open class JsonMultiSelectTriFilter(
     genres: List<MultiSelectTriOption>,
 ) : Filter.Group<MultiSelectTriOption>(name, genres),
     JsonFilter {
-    override fun addToJsonObject(builder: JsonObjectBuilder, additionExcludeList: List<String>) {
+    override fun addToJsonObject(
+        builder: JsonObjectBuilder,
+        key: String,
+        additionExcludeList: List<String>,
+    ) {
         val whatToInclude = state.filter { it.state == TriState.STATE_INCLUDE }.map { it.id }
         val whatToExclude = state.filter { it.state == TriState.STATE_EXCLUDE }.map { it.id } + additionExcludeList
 
         with(builder) {
-            if (whatToInclude.isNotEmpty()) {
-                putJsonObject("inclusive_$param") {
-                    putJsonArray("values") {
-                        whatToInclude.forEach { add(it) }
-                    }
+            if (whatToInclude.isNotEmpty() || whatToExclude.isNotEmpty()) {
+                putJsonObject(key) {
                     put("match_all", true)
-                }
-            }
-            if (whatToExclude.isNotEmpty()) {
-                putJsonObject("exclusive_$param") {
-                    putJsonArray("values") {
-                        whatToExclude.forEach { add(it) }
+                    if (whatToInclude.isNotEmpty()) {
+                        putJsonArray("values") {
+                            whatToInclude.forEach { add(it) }
+                        }
                     }
-                    put("match_all", false)
+
+                    if (whatToExclude.isNotEmpty()) {
+                        putJsonArray("exclude") {
+                            whatToExclude.forEach { add(it) }
+                        }
+                    }
                 }
             }
         }
@@ -166,7 +183,11 @@ internal open class JsonMultiSelectTriFilter(
 }
 
 internal interface JsonFilter {
-    fun addToJsonObject(builder: JsonObjectBuilder, additionExcludeList: List<String> = emptyList())
+    fun addToJsonObject(
+        builder: JsonObjectBuilder,
+        key: String = "",
+        additionExcludeList: List<String> = emptyList(),
+    )
 }
 
 internal val GenresList = arrayOf(

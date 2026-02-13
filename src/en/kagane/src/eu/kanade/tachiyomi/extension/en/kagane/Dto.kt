@@ -9,6 +9,34 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 
 @Serializable
+class GenreDto(
+    val id: String,
+    @SerialName("genre_name")
+    val genreName: String,
+)
+
+@Serializable
+class TagDto(
+    val id: String,
+    @SerialName("tag_name")
+    val tagName: String,
+)
+
+@Serializable
+class SourcesDto(
+    val sources: List<SourceDto>,
+)
+
+@Serializable
+class SourceDto(
+    @SerialName("source_id")
+    val sourceId: String,
+    val title: String,
+    @SerialName("source_type")
+    val sourceType: String,
+)
+
+@Serializable
 class SearchDto(
     val content: List<Book> = emptyList(),
     val last: Boolean = true,
@@ -36,8 +64,8 @@ class SearchDto(
         val alternateTitles: List<String> = emptyList(),
     ) {
 
-        fun toSManga(domain: String, showSource: Boolean): SManga = SManga.create().apply {
-            title = this@Book.title.trim()
+        fun toSManga(domain: String, showSource: Boolean, sources: Map<String, String>): SManga = SManga.create().apply {
+            title = if (showSource) "${this@Book.title.trim()} [${sources[this@Book.sourceId]}]" else this@Book.title.trim()
             url = id
             thumbnail_url = coverImage?.let { "$domain/api/v2/image/$it" }
         }
