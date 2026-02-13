@@ -117,9 +117,9 @@ class DetailsDto(
         // Extract authors from staff (roles like "Author", "Artist", "Story", "Art")
         val authors = seriesStaff.filter {
             it.role.contains("Author", ignoreCase = true) ||
-            it.role.contains("Story", ignoreCase = true) ||
-            it.role.contains("Art", ignoreCase = true) ||
-            it.role.contains("Artist", ignoreCase = true)
+                it.role.contains("Story", ignoreCase = true) ||
+                it.role.contains("Art", ignoreCase = true) ||
+                it.role.contains("Artist", ignoreCase = true)
         }.map { it.name }.distinct()
 
         author = authors.joinToString()
@@ -128,14 +128,12 @@ class DetailsDto(
         status = this@DetailsDto.publicationStatus.toStatus()
     }
 
-    private fun String.toStatus(): Int {
-        return when (this.uppercase()) {
-            "ONGOING" -> SManga.ONGOING
-            "COMPLETED" -> SManga.COMPLETED
-            "HIATUS" -> SManga.ON_HIATUS
-            "CANCELLED" -> SManga.CANCELLED
-            else -> SManga.UNKNOWN
-        }
+    private fun String.toStatus(): Int = when (this.uppercase()) {
+        "ONGOING" -> SManga.ONGOING
+        "COMPLETED" -> SManga.COMPLETED
+        "HIATUS" -> SManga.ON_HIATUS
+        "CANCELLED" -> SManga.CANCELLED
+        else -> SManga.UNKNOWN
     }
 }
 
@@ -173,16 +171,14 @@ class ChapterDto(
             }
         }
 
-        private fun buildChapterName(): String {
-            return if (!chapterNo.isNullOrBlank()) {
-                if (title.isNotBlank()) {
-                    "Chapter $chapterNo: $title"
-                } else {
-                    "Chapter $chapterNo"
-                }
+        private fun buildChapterName(): String = if (!chapterNo.isNullOrBlank()) {
+            if (title.isNotBlank()) {
+                "Chapter $chapterNo: $title"
             } else {
-                title
+                "Chapter $chapterNo"
             }
+        } else {
+            title
         }
     }
 
@@ -197,6 +193,19 @@ class ChallengeDto(
     val accessToken: String,
     @SerialName("cache_url")
     val cacheUrl: String,
-    @SerialName("page_mapping")
-    val pageMapping: Map<Int, String>,
+    val pages: List<PageDto>,
+)
+
+@Serializable
+class PageDto(
+    @SerialName("page_number")
+    val pageNumber: Int,
+    @SerialName("page_uuid")
+    val pageUuid: String,
+)
+
+@Serializable
+class IntegrityDto(
+    val token: String,
+    val exp: Long,
 )
