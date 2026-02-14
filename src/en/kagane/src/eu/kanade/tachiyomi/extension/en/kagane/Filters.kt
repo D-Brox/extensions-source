@@ -16,12 +16,11 @@ data class MetadataDto(
     val sources: Map<String, String>,
 ) {
     fun getGenresList() = genres
-        .map { (k, v) -> FilterData(k, v) }
-
+        .map { (k, v) -> FilterData(k, v) }.sortedBy { it.name }
     fun getTagsList() = tags
-        .map { (k, v) -> FilterData(k, v.replaceFirstChar { c -> c.uppercase() }) }
+        .map { (k, v) -> FilterData(k, v.replaceFirstChar { c -> c.uppercase() }) }.sortedBy { it.name }
     fun getSourcesList() = sources
-        .map { (k, v) -> FilterData(k, v) }
+        .map { (k, v) -> FilterData(k, v) }.sortedBy { it.name }
 }
 
 @Serializable
