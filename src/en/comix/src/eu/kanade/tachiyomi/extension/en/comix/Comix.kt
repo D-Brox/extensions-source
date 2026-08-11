@@ -1,6 +1,9 @@
 package eu.kanade.tachiyomi.extension.en.comix
 
 import android.content.SharedPreferences
+import android.graphics.BitmapFactory
+import android.util.Base64
+import android.webkit.CookieManager
 import android.webkit.WebResourceResponse
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
@@ -8,6 +11,7 @@ import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.MangasPage
@@ -27,6 +31,7 @@ import keiyoushi.utils.int
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
 import keiyoushi.utils.string
+import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
@@ -91,6 +96,112 @@ abstract class Comix :
         .rateLimit(5)
 
     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
+        .apply {
+            storedWafCookie()?.let { add("Cookie", it) }
+        }
+
+    // ============================== WAF ==============================
+    // The site serves a rotate-to-align captcha before trusting a client. The
+    // "main" image is a circle at the correct orientation and the "thumb" is its
+    // rotated center sub-image; the server accepts the clockwise angle that fixes
+    // the thumb and answers with a `waf_pass` cookie that all requests must carry.
+    private var cachedWafCookie: String? = null
+
+    private fun storedWafCookie(): String? {
+        cachedWafCookie?.let { return it }
+        return preferences.getString(PREF_WAF_COOKIE, null)?.also { cachedWafCookie = it }
+    }
+
+    private fun saveWafCookie(cookie: String?) {
+        cachedWafCookie = cookie
+        preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
+    }
+
+    /**
+     * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
+     * is set (e.g. a request just came back as the challenge page) or none is
+     * stored yet. The WebView needs the cookie too, so it is mirrored into the
+     * WebView cookie store.
+     */
+    @Synchronized
+    private fun obtainWafCookie(forceRefresh: Boolean): String? {
+        if (!forceRefresh) {
+            storedWafCookie()?.let { return it }
+        }
+        repeat(WAF_MAX_ATTEMPTS) {
+            trySolveWafChallenge()?.let { cookie ->
+                saveWafCookie(cookie)
+                runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
+                return cookie
+            }
+        }
+        saveWafCookie(null)
+        return null
+    }
+
+    private fun trySolveWafChallenge(): String? {
+        val url = "$baseUrl/@waf/generate"
+        val apiHeaders = headersBuilder()
+            .removeAll("Cookie")
+            .set("Accept", "application/json")
+            .build()
+        return try {
+            val challenge = client.newCall(GET(url, apiHeaders))
+                .execute()
+                .use { it.parseAs<WafChallengeResponse>() }
+            val original = decodeDataUri(challenge.imageBase64)
+            val rotatedCrop = decodeDataUri(challenge.thumbBase64)
+            if (original == null || rotatedCrop == null) {
+                original?.recycle()
+                rotatedCrop?.recycle()
+                return null
+            }
+            try {
+                val angle = RotationEstimator.estimateRotationAngle(original, rotatedCrop)
+                val verify = POST(
+                    "$baseUrl/@waf/verify",
+                    apiHeaders,
+                    WafVerifyRequest(challenge.captchaId, angle % 360).toJsonRequestBody(),
+                )
+                client.newCall(verify).execute().use { response ->
+                    val cookie = response.headers("Set-Cookie")
+                        .firstOrNull { it.startsWith("waf_pass=") }
+                        ?.substringBefore(";")
+                    if (response.parseAs<WafVerifyResponse>().success) cookie else null
+                }
+            } finally {
+                original.recycle()
+                rotatedCrop.recycle()
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private fun decodeDataUri(uri: String): android.graphics.Bitmap? = runCatching {
+        val bytes = Base64.decode(uri.substringAfter(','), Base64.DEFAULT)
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+    }.getOrNull()
+
+    /**
+     * Fetches a page HTML, transparently refreshing the WAF cookie and retrying
+     * once when the server answers with the rotate captcha page instead.
+     */
+    private suspend fun fetchPage(url: HttpUrl): Document = fetchPage(url.toString())
+
+    private suspend fun fetchPage(url: String): Document {
+        val document = client.get(url).asJsoup()
+        if (!document.isWafChallenge()) return document
+        obtainWafCookie(forceRefresh = true)
+        val retry = client.get(url).asJsoup()
+        if (retry.isWafChallenge()) {
+            throw Exception("WAF challenge could not be solved")
+        }
+        return retry
+    }
+
+    private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
+        selectFirst("#stage") != null
 
     override suspend fun getPopularManga(page: Int): MangasPage {
         val url = baseUrl.toHttpUrl().newBuilder().apply {
@@ -110,7 +221,7 @@ abstract class Comix :
             )
         }
 
-        val document = client.get(url).asJsoup()
+        val document = fetchPage(url)
         val contentRating = url.queryParameter("content_rating")
             ?: preferences.contentRating()
         val effectiveContentRating = contentRating
@@ -385,7 +496,7 @@ abstract class Comix :
         var cachedDocument: Document? = null
         suspend fun getDocument(): Document {
             cachedDocument?.let { return it }
-            return client.get(getMangaUrl(manga)).asJsoup().also { cachedDocument = it }
+            return fetchPage(getMangaUrl(manga)).also { cachedDocument = it }
         }
 
         val deduplicateChapters = preferences.deduplicateChapters()
@@ -806,6 +917,9 @@ abstract class Comix :
         initializationScript: String? = null,
         buildScript: (passPayloadName: String, rejectName: String) -> String,
     ): String {
+        runCatching {
+            storedWafCookie()?.let { CookieManager.getInstance().setCookie(baseUrl, it) }
+        }
         val timeoutDeadline = AtomicLong(
             System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds,
         )
@@ -1069,8 +1183,10 @@ abstract class Comix :
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
         private const val PREF_SCORE_POSITION = "pref_score_position"
+        private const val PREF_WAF_COOKIE = "pref_waf_cookie"
 
         private const val DEFAULT_CONTENT_RATING = "suggestive"
+        private const val WAF_MAX_ATTEMPTS = 3
         private const val WEBVIEW_TIMEOUT_SECONDS = 120L
         private const val SCRIPT_RETRY_INTERVAL_MS = 100L
         private const val MAX_CHAPTER_PAGES = 200

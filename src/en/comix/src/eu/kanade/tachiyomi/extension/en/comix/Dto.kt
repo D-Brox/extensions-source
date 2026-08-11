@@ -15,6 +15,24 @@ const val CHAPTER_ID_MEMO = "chapterId"
 const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
 
 @Serializable
+class WafChallengeResponse(
+    @SerialName("captcha_id") val captchaId: String,
+    @SerialName("image_base64") val imageBase64: String,
+    @SerialName("thumb_base64") val thumbBase64: String,
+)
+
+@Serializable
+class WafVerifyRequest(
+    @SerialName("captcha_id") val captchaId: String,
+    val angle: Int,
+)
+
+@Serializable
+class WafVerifyResponse(
+    val success: Boolean,
+)
+
+@Serializable
 class Term(
     val title: String,
 )
