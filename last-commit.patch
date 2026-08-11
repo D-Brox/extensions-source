@@ -1,0 +1,320 @@
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
+index 806aa3bc6..0e5532b05 100644
+--- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Comix.kt
+@@ -1,6 +1,9 @@
+ package eu.kanade.tachiyomi.extension.en.comix
+ 
+ import android.content.SharedPreferences
++import android.graphics.BitmapFactory
++import android.util.Base64
++import android.webkit.CookieManager
+ import android.webkit.WebResourceResponse
+ import androidx.preference.EditTextPreference
+ import androidx.preference.ListPreference
+@@ -8,6 +11,7 @@ import androidx.preference.MultiSelectListPreference
+ import androidx.preference.PreferenceScreen
+ import androidx.preference.SwitchPreferenceCompat
+ import eu.kanade.tachiyomi.network.GET
++import eu.kanade.tachiyomi.network.POST
+ import eu.kanade.tachiyomi.source.ConfigurableSource
+ import eu.kanade.tachiyomi.source.model.FilterList
+ import eu.kanade.tachiyomi.source.model.MangasPage
+@@ -27,6 +31,7 @@ import keiyoushi.utils.int
+ import keiyoushi.utils.parseAs
+ import keiyoushi.utils.runWebView
+ import keiyoushi.utils.string
++import keiyoushi.utils.toJsonRequestBody
+ import kotlinx.coroutines.async
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.serialization.json.JsonElement
+@@ -91,6 +96,112 @@ abstract class Comix :
+         .rateLimit(5)
+ 
+     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
++        .apply {
++            storedWafCookie()?.let { add("Cookie", it) }
++        }
++
++    // ============================== WAF ==============================
++    // The site serves a rotate-to-align captcha before trusting a client. The
++    // "main" image is a circle at the correct orientation and the "thumb" is its
++    // rotated center sub-image; the server accepts the clockwise angle that fixes
++    // the thumb and answers with a `waf_pass` cookie that all requests must carry.
++    private var cachedWafCookie: String? = null
++
++    private fun storedWafCookie(): String? {
++        cachedWafCookie?.let { return it }
++        return preferences.getString(PREF_WAF_COOKIE, null)?.also { cachedWafCookie = it }
++    }
++
++    private fun saveWafCookie(cookie: String?) {
++        cachedWafCookie = cookie
++        preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
++    }
++
++    /**
++     * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
++     * is set (e.g. a request just came back as the challenge page) or none is
++     * stored yet. The WebView needs the cookie too, so it is mirrored into the
++     * WebView cookie store.
++     */
++    @Synchronized
++    private fun obtainWafCookie(forceRefresh: Boolean): String? {
++        if (!forceRefresh) {
++            storedWafCookie()?.let { return it }
++        }
++        repeat(WAF_MAX_ATTEMPTS) {
++            trySolveWafChallenge()?.let { cookie ->
++                saveWafCookie(cookie)
++                runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
++                return cookie
++            }
++        }
++        saveWafCookie(null)
++        return null
++    }
++
++    private fun trySolveWafChallenge(): String? {
++        val url = "$baseUrl/@waf/generate"
++        val apiHeaders = headersBuilder()
++            .removeAll("Cookie")
++            .set("Accept", "application/json")
++            .build()
++        return try {
++            val challenge = client.newCall(GET(url, apiHeaders))
++                .execute()
++                .use { it.parseAs<WafChallengeResponse>() }
++            val original = decodeDataUri(challenge.imageBase64)
++            val rotatedCrop = decodeDataUri(challenge.thumbBase64)
++            if (original == null || rotatedCrop == null) {
++                original?.recycle()
++                rotatedCrop?.recycle()
++                return null
++            }
++            try {
++                val angle = RotationEstimator.estimateRotationAngle(original, rotatedCrop)
++                val verify = POST(
++                    "$baseUrl/@waf/verify",
++                    apiHeaders,
++                    WafVerifyRequest(challenge.captchaId, angle % 360).toJsonRequestBody(),
++                )
++                client.newCall(verify).execute().use { response ->
++                    val cookie = response.headers("Set-Cookie")
++                        .firstOrNull { it.startsWith("waf_pass=") }
++                        ?.substringBefore(";")
++                    if (response.parseAs<WafVerifyResponse>().success) cookie else null
++                }
++            } finally {
++                original.recycle()
++                rotatedCrop.recycle()
++            }
++        } catch (e: Exception) {
++            null
++        }
++    }
++
++    private fun decodeDataUri(uri: String): android.graphics.Bitmap? = runCatching {
++        val bytes = Base64.decode(uri.substringAfter(','), Base64.DEFAULT)
++        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
++    }.getOrNull()
++
++    /**
++     * Fetches a page HTML, transparently refreshing the WAF cookie and retrying
++     * once when the server answers with the rotate captcha page instead.
++     */
++    private suspend fun fetchPage(url: HttpUrl): Document = fetchPage(url.toString())
++
++    private suspend fun fetchPage(url: String): Document {
++        val document = client.get(url).asJsoup()
++        if (!document.isWafChallenge()) return document
++        obtainWafCookie(forceRefresh = true)
++        val retry = client.get(url).asJsoup()
++        if (retry.isWafChallenge()) {
++            throw Exception("WAF challenge could not be solved")
++        }
++        return retry
++    }
++
++    private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
++        selectFirst("#stage") != null
+ 
+     override suspend fun getPopularManga(page: Int): MangasPage {
+         val url = baseUrl.toHttpUrl().newBuilder().apply {
+@@ -110,7 +221,7 @@ abstract class Comix :
+             )
+         }
+ 
+-        val document = client.get(url).asJsoup()
++        val document = fetchPage(url)
+         val contentRating = url.queryParameter("content_rating")
+             ?: preferences.contentRating()
+         val effectiveContentRating = contentRating
+@@ -385,7 +496,7 @@ abstract class Comix :
+         var cachedDocument: Document? = null
+         suspend fun getDocument(): Document {
+             cachedDocument?.let { return it }
+-            return client.get(getMangaUrl(manga)).asJsoup().also { cachedDocument = it }
++            return fetchPage(getMangaUrl(manga)).also { cachedDocument = it }
+         }
+ 
+         val deduplicateChapters = preferences.deduplicateChapters()
+@@ -814,6 +925,9 @@ abstract class Comix :
+         initializationScript: String? = null,
+         buildScript: (passPayloadName: String, rejectName: String) -> String,
+     ): String {
++        runCatching {
++            storedWafCookie()?.let { CookieManager.getInstance().setCookie(baseUrl, it) }
++        }
+         val timeoutDeadline = AtomicLong(
+             System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds,
+         )
+@@ -1077,8 +1191,10 @@ abstract class Comix :
+         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
+         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
+         private const val PREF_SCORE_POSITION = "pref_score_position"
++        private const val PREF_WAF_COOKIE = "pref_waf_cookie"
+ 
+         private const val DEFAULT_CONTENT_RATING = "suggestive"
++        private const val WAF_MAX_ATTEMPTS = 3
+         private const val WEBVIEW_TIMEOUT_SECONDS = 120L
+         private const val SCRIPT_RETRY_INTERVAL_MS = 100L
+         private const val MAX_CHAPTER_PAGES = 200
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
+index 1a297c46f..09d101ae7 100644
+--- a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/Dto.kt
+@@ -18,6 +18,24 @@ const val CHAPTER_GROUP_ID_MEMO = "groupId"
+ const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
+ const val CHAPTER_LIST_BLACKLIST_MEMO = "chapterListBlacklist"
+ 
++@Serializable
++class WafChallengeResponse(
++    @SerialName("captcha_id") val captchaId: String,
++    @SerialName("image_base64") val imageBase64: String,
++    @SerialName("thumb_base64") val thumbBase64: String,
++)
++
++@Serializable
++class WafVerifyRequest(
++    @SerialName("captcha_id") val captchaId: String,
++    val angle: Int,
++)
++
++@Serializable
++class WafVerifyResponse(
++    val success: Boolean,
++)
++
+ @Serializable
+ class Term(
+     val title: String,
+diff --git a/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt
+new file mode 100644
+index 000000000..37417acaf
+--- /dev/null
++++ b/src/en/comix/src/eu/kanade/tachiyomi/extension/en/comix/RotationEstimator.kt
+@@ -0,0 +1,103 @@
++package eu.kanade.tachiyomi.extension.en.comix
++
++import android.graphics.Bitmap
++import kotlin.math.PI
++import kotlin.math.cos
++import kotlin.math.floor
++import kotlin.math.sin
++
++/**
++ * Recovers the clockwise angle by which a centered square crop was rotated.
++ *
++ * `rotatedCrop` is the central `size×size` region of `original`, rotated around
++ * its center so that pixels with no source data became transparent. The
++ * reference is the same central region read straight from `original`, so only
++ * the rotation angle needs to be estimated.
++ *
++ * Scoring samples `rotatedCrop` at the back-rotated coordinates of each
++ * reference pixel (bilinear interpolation) and accumulates mean-squared error
++ * over pixels that are both in-bounds and opaque. Out-of-bounds and transparent
++ * samples are skipped entirely - the transparent corner wedges are invalid data,
++ * not black. Normalizing by the valid pixel count keeps the metric comparable
++ * across angles that expose different amounts of valid area.
++ *
++ * A 1-degree scan on a downsampled grid locates the peak cheaply; the returned
++ * angle is the integer degree (0-359) the server expects. The whole search
++ * reuses a single set of pixel buffers; no rotated bitmap is allocated per
++ * angle.
++ */
++object RotationEstimator {
++
++    private const val ALPHA_THRESHOLD = 128f
++    private const val COARSE_GRID = 128
++    private const val MIN_VALID_PIXELS = 100
++
++    fun estimateRotationAngle(original: Bitmap, rotatedCrop: Bitmap): Int {
++        val size = rotatedCrop.width
++        val total = size * size
++        val offset = (original.width - size) / 2
++
++        val refGray = FloatArray(total)
++        val rotGray = FloatArray(total)
++        val rotAlpha = FloatArray(total)
++
++        val refPixels = IntArray(total)
++        val rotPixels = IntArray(total)
++        original.getPixels(refPixels, 0, size, offset, offset, size, size)
++        rotatedCrop.getPixels(rotPixels, 0, size, 0, 0, size, size)
++
++        for (i in 0 until total) {
++            val r = refPixels[i]
++            refGray[i] = (((r ushr 16) and 0xFF) + ((r ushr 8) and 0xFF) + (r and 0xFF)) / 3f
++            val t = rotPixels[i]
++            rotGray[i] = (((t ushr 16) and 0xFF) + ((t ushr 8) and 0xFF) + (t and 0xFF)) / 3f
++            rotAlpha[i] = (t ushr 24).toFloat()
++        }
++
++        val center = (size - 1) / 2f
++
++        // Coarse scan: 1-degree steps over the whole circle on a small grid.
++        val scale = size.toFloat() / COARSE_GRID
++        val gridPoints = COARSE_GRID * COARSE_GRID
++        val gridX = FloatArray(gridPoints)
++        val gridY = FloatArray(gridPoints)
++        val refSamples = FloatArray(gridPoints)
++        for (i in 0 until gridPoints) {
++            val gx = (i % COARSE_GRID) * scale
++            val gy = (i / COARSE_GRID) * scale
++            gridX[i] = gx
++            gridY[i] = gy
++            refSamples[i] = refGray[floor(gy).toInt() * size + floor(gx).toInt()]
++        }
++
++        var bestAngle = 0
++        var bestScore = Float.MAX_VALUE
++        for (a in 0 until 360) {
++            val rad = a * PI / 180.0
++            val ca = cos(rad).toFloat()
++            val sa = sin(rad).toFloat()
++            var sum = 0f
++            var valid = 0
++            for (i in 0 until gridPoints) {
++                val vx = gridX[i] - center
++                val vy = gridY[i] - center
++                val qx = center + vx * ca + vy * sa
++                val qy = center - vx * sa + vy * ca
++                if (qx < 0f || qx >= size || qy < 0f || qy >= size) continue
++                val idx = floor(qy).toInt() * size + floor(qx).toInt()
++                if (rotAlpha[idx] <= ALPHA_THRESHOLD) continue
++                val d = refSamples[i] - rotGray[idx]
++                sum += d * d
++                valid++
++            }
++            if (valid < MIN_VALID_PIXELS) continue
++            val score = sum / valid
++            if (score < bestScore) {
++                bestScore = score
++                bestAngle = a
++            }
++        }
++
++        return bestAngle
++    }
++}
