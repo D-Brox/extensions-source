@@ -351,3 +351,20 @@ class ChapterResponse(
         val s: Int = 0,
     )
 }
+
+/** Response of the comix-proxy `/sign` endpoint. */
+@Serializable
+class ProxySignResponse(
+    val token: String,
+    @SerialName("waf_pass") val wafPass: String,
+    @SerialName("cf_clearance") val cfClearance: String,
+    @SerialName("user_agent") val userAgent: String,
+)
+
+/** Response of the comix-proxy `/cookies` endpoint. */
+@Serializable
+class ProxyCookiesResponse(
+    @SerialName("waf_pass") val wafPass: String,
+    @SerialName("cf_clearance") val cfClearance: String,
+    @SerialName("user_agent") val userAgent: String,
+)

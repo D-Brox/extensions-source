@@ -36,17 +36,21 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import okhttp3.CookieJar
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.Response
 import okio.Buffer
 import org.json.JSONObject
 import org.jsoup.nodes.Document
+import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicLong
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
@@ -71,7 +75,8 @@ abstract class Comix :
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<String>>?) = size > TAG_ID_CACHE_SIZE
     }
 
-    override fun OkHttpClient.Builder.configureClient() = addInterceptor(Descrambler.interceptor)
+    override fun OkHttpClient.Builder.configureClient() = cookieJar(CookieJar.NO_COOKIES)
+        .addInterceptor(Descrambler.interceptor)
         .addInterceptor { chain ->
             val request = chain.request()
 
@@ -97,7 +102,13 @@ abstract class Comix :
 
     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
         .apply {
-            storedWafCookie()?.let { add("Cookie", it) }
+            val proxy = proxyServer()
+            if (proxy != null) {
+                storedProxyCookie()?.let { add("Cookie", it) }
+                storedProxyUserAgent()?.let { set("User-Agent", it) }
+            } else {
+                storedWafCookie()?.let { add("Cookie", it) }
+            }
         }
 
     // ============================== WAF ==============================
@@ -115,6 +126,91 @@ abstract class Comix :
     private fun saveWafCookie(cookie: String?) {
         cachedWafCookie = cookie
         preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
+    }
+
+    // ============================== Proxy ==============================
+    // When a comix-proxy server is configured, the extension offloads both the
+    // cipher material and the WAF/Cloudflare cookies to it. The proxy mints the
+    // `_` token, solves the site's rotate captcha (`waf_pass`) and Cloudflare
+    // (`cf_clearance`) via FlareSolverr, and returns the UA it solved with
+    // (cf_clearance is UA-bound, so the extension must echo it). Everything is
+    // fetched through the cleared client and cached here.
+    private var cachedProxyCookie: String? = null
+    private var cachedProxyUserAgent: String? = null
+
+    private fun proxyServer(): String? = preferences.getString(PREF_PROXY_SERVER, null)
+        ?.trim()
+        ?.takeIf { it.isNotBlank() }
+
+    private fun storedProxyCookie(): String? {
+        cachedProxyCookie?.let { return it }
+        return preferences.getString(PREF_PROXY_COOKIE, null)?.also { cachedProxyCookie = it }
+    }
+
+    private fun storedProxyUserAgent(): String? {
+        cachedProxyUserAgent?.let { return it }
+        return preferences.getString(PREF_PROXY_USER_AGENT, null)?.also { cachedProxyUserAgent = it }
+    }
+
+    private fun saveProxySession(sign: ProxySignResponse) {
+        val cookie = "cf_clearance=${sign.cfClearance}; waf_pass=${sign.wafPass}"
+        cachedProxyCookie = cookie
+        cachedProxyUserAgent = sign.userAgent
+        preferences.edit()
+            .putString(PREF_PROXY_COOKIE, cookie)
+            .putString(PREF_PROXY_USER_AGENT, sign.userAgent)
+            .apply()
+        runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
+    }
+
+    /**
+     * Calls `{proxy}/sign` for the signed [path] with canonicalized [params] and
+     * returns the minted token plus the proxy's current cookies/UA. The qs is
+     * the canonical (raw-bracket) form the site's serializer produces; the proxy
+     * mints the token over it and the URL is later rebuilt with the same sorted
+     * params, so ordering matches what the server validates.
+     */
+    private fun proxySign(
+        proxy: String,
+        path: String,
+        params: Map<String, List<String>>,
+        forceRefresh: Boolean = false,
+    ): ProxySignResponse? {
+        val qs = ComixCrypto.canonicalizes(params)
+        val url = proxy.trimEnd('/') +
+            "/sign?path=" + URLEncoder.encode(path, "UTF-8") +
+            "&qs=" + URLEncoder.encode(qs, "UTF-8") +
+            if (forceRefresh) "&force=1" else ""
+        return runCatching {
+            client.newCall(GET(url, headers)).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    null
+                } else {
+                    resp.parseAs<ProxySignResponse>()
+                }
+            }
+        }.getOrNull()?.also { saveProxySession(it) }
+    }
+
+    /** Fetches the proxy's current cipher material (`/material`, `{s:[],k:[]}`). */
+    private fun proxyMaterial(proxy: String): ComixMaterial? {
+        val url = proxy.trimEnd('/') + "/material"
+        return runCatching {
+            client.newCall(GET(url, headers)).execute().use { resp ->
+                if (!resp.isSuccessful) {
+                    null
+                } else {
+                    resp.body.string().let { ComixMaterial.tryFromJson(it) }
+                }
+            }
+        }.getOrNull()
+    }
+
+    /** Tells the proxy to re-extract material from the live site. */
+    private fun refreshProxyMaterial(proxy: String) {
+        runCatching {
+            client.newCall(POST(proxy.trimEnd('/') + "/refresh-material")).execute().close()
+        }
     }
 
     /**
@@ -167,7 +263,8 @@ abstract class Comix :
                     val cookie = response.headers("Set-Cookie")
                         .firstOrNull { it.startsWith("waf_pass=") }
                         ?.substringBefore(";")
-                    if (response.parseAs<WafVerifyResponse>().success) cookie else null
+                    val success = response.parseAs<WafVerifyResponse>().success
+                    if (success) cookie else null
                 }
             } finally {
                 original.recycle()
@@ -185,19 +282,49 @@ abstract class Comix :
 
     /**
      * Fetches a page HTML, transparently refreshing the WAF cookie and retrying
-     * once when the server answers with the rotate captcha page instead.
+     * once when the server answers with the rotate captcha page instead. In proxy
+     * mode the refresh goes through the proxy (`/cookies?force=1`) which solves
+     * Cloudflare + the site captcha remotely.
      */
     private suspend fun fetchPage(url: HttpUrl): Document = fetchPage(url.toString())
 
     private suspend fun fetchPage(url: String): Document {
         val document = client.get(url).asJsoup()
         if (!document.isWafChallenge()) return document
-        obtainWafCookie(forceRefresh = true)
+        refreshCookiesOrWaf()
         val retry = client.get(url).asJsoup()
         if (retry.isWafChallenge()) {
             throw Exception("WAF challenge could not be solved")
         }
         return retry
+    }
+
+    /**
+     * Refreshes the current WAF session: asks the proxy to re-solve cookies
+     * (`/cookies?force=1`) when a proxy is configured, otherwise solves the
+     * site's rotate captcha natively.
+     */
+    private fun refreshCookiesOrWaf() {
+        val proxy = proxyServer()
+        if (proxy == null) {
+            obtainWafCookie(forceRefresh = true)
+            return
+        }
+        val cookies = runCatching {
+            client.newCall(GET(proxy.trimEnd('/') + "/cookies?force=1", headers)).execute().use { resp ->
+                if (resp.isSuccessful) resp.parseAs<ProxyCookiesResponse>() else null
+            }
+        }.getOrNull()
+        if (cookies != null) {
+            saveProxySession(
+                ProxySignResponse(
+                    token = "",
+                    wafPass = cookies.wafPass,
+                    cfClearance = cookies.cfClearance,
+                    userAgent = cookies.userAgent,
+                ),
+            )
+        }
     }
 
     private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
@@ -726,7 +853,7 @@ abstract class Comix :
     }
 
     private suspend fun getNativeChapterList(manga: SManga, latestChapterId: Int?): List<SChapter>? {
-        if (cipher == null) return null
+        if (proxyServer() == null && cipher == null) return null
         val mangaSlug = getMangaUrl(manga).toHttpUrl().pathSegments.getOrNull(1) ?: return null
         val mangaId = manga.mangaId() ?: return null
         val chapters = mutableListOf<Chapter>()
@@ -846,9 +973,153 @@ abstract class Comix :
     }
 
     private suspend fun getNativePageList(chapter: SChapter): List<Page>? {
-        if (cipher == null) return null
+        if (proxyServer() == null && cipher == null) return null
         val chapterId = chapter.chapterId() ?: return null
         return getSigned<ChapterResponse>("/api/v1/chapters/$chapterId", emptyMap())?.let(::buildPages)
+    }
+
+    // ====================== Native signed API =========================
+    // The /api/v1/* endpoints require every request to carry a `_` token minted
+    // with the site's live cipher material (see ComixMaterial), which comes from
+    // the proxy server; responses are plaintext JSON. Native calls are a cheap
+    // alternative to booting the SPA in a WebView; a signature rejection means
+    // the site rotated its material, so the cache is dropped, the material is
+    // re-fetched from the proxy, and the call retried once before falling back
+    // to the WebView path.
+
+    private class CipherRotatedException(message: String) : Exception(message)
+
+    private fun cachedMaterial(): ComixMaterial? = preferences.getString(PREF_CIPHER_MATERIAL, null)
+        ?.let { ComixMaterial.tryFromJson(it) }
+
+    private fun cacheMaterial(material: ComixMaterial) {
+        preferences.edit().putString(PREF_CIPHER_MATERIAL, material.toJsonString()).apply()
+    }
+
+    private fun clearCachedMaterial() {
+        preferences.edit().remove(PREF_CIPHER_MATERIAL).apply()
+    }
+
+    /**
+     * Runs [block] with the cached (or freshly fetched) cipher, persisting the
+     * material only after it produced a valid response. A signature rejection
+     * (the site rotated its material) clears the cache, re-fetches once, and
+     * retries; any other failure returns null so callers fall back to WebView.
+     *
+     * Material always comes from the proxy server: the extension no longer
+     * extracts the cipher bundles itself, and a rotation triggers a proxy-side
+     * re-extraction.
+     */
+    private fun <T> withCipher(proxy: String, block: (ComixCipher) -> T?): T? {
+        var material = cachedMaterial()
+        if (material == null) {
+            material = proxyMaterial(proxy)
+        }
+        if (material == null) {
+            return null
+        }
+
+        try {
+            val result = block(material.toCipher())
+            cacheMaterial(material)
+            return result
+        } catch (e: CipherRotatedException) {
+            clearCachedMaterial()
+            refreshProxyMaterial(proxy)
+            val fresh = proxyMaterial(proxy) ?: return null
+            val result = try {
+                block(fresh.toCipher())
+            } catch (e2: Exception) {
+                null
+            }
+            if (result != null) {
+                cacheMaterial(fresh)
+            }
+            return result
+        } catch (e: Exception) {
+            return null
+        }
+    }
+
+    /**
+     * Executes a proxy-backed signed call: mints the token via `/sign`, builds
+     * the URL with the same canonical param ordering, and retries once with a
+     * forced cookie refresh when the server answers with a challenge.
+     */
+    private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
+        val sign = proxySign(proxy, path, params)
+            ?: throw Exception("Proxy sign failed")
+        var response = client.newCall(signedRequest(path, params, sign.token)).execute()
+        if (response.isApiChallenge()) {
+            response.close()
+            val refreshed = proxySign(proxy, path, params, forceRefresh = true)
+                ?: throw Exception("Proxy sign refresh failed")
+            response = client.newCall(signedRequest(path, params, refreshed.token)).execute()
+        }
+        return response
+    }
+
+    private fun Response.isApiChallenge(): Boolean {
+        if (isSuccessful) return false
+        if (code == 401) return false
+        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
+        return body.contains("captcha_required") ||
+            body.contains("Security check") ||
+            body.contains("id=\"stage\"") ||
+            body.contains("Just a moment") ||
+            body.contains("cf-chl") ||
+            body.contains("<html", ignoreCase = true)
+    }
+
+    /** Builds the signed request using a pre-minted [token]. */
+    private fun signedRequest(
+        path: String,
+        params: Map<String, List<String>>,
+        token: String,
+    ): Request {
+        val builder = baseUrl.toHttpUrl().newBuilder()
+            .addPathSegments(path.trimStart('/'))
+        params.entries
+            .sortedBy { it.key }
+            .forEach { (key, values) ->
+                if (values.size == 1) {
+                    builder.addQueryParameter(key, values[0])
+                } else {
+                    values.forEachIndexed { i, v -> builder.addQueryParameter("$key[$i]", v) }
+                }
+            }
+        builder.addQueryParameter("_", token)
+        return GET(builder.build(), headers)
+    }
+
+    private fun responseBodyOrThrow(response: Response, cipher: ComixCipher): String {
+        val body = response.body.string()
+        response.close()
+        if (response.code == 403 &&
+            (
+                body.contains("Invalid token", ignoreCase = true) ||
+                    body.contains("Missing token", ignoreCase = true)
+                )
+        ) {
+            throw CipherRotatedException(body.take(160))
+        }
+        if (!response.isSuccessful) {
+            throw Exception("API returned ${response.code}")
+        }
+        return decodeSignal(body, cipher)
+    }
+
+    /** Passes plaintext responses through; decrypts an `"e"` envelope if present. */
+    private fun decodeSignal(body: String, cipher: ComixCipher): String {
+        val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
+            ?: return body
+        val e = root["e"] as? JsonPrimitive ?: return body
+        val decrypted = cipher.decrypt(e.content)
+        val parsed = runCatching { decrypted.parseAs<JsonObject>() }.getOrNull()
+        if (parsed == null) {
+            throw CipherRotatedException(decrypted.take(160))
+        }
+        return decrypted
     }
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
@@ -857,6 +1128,16 @@ abstract class Comix :
         path: String,
         params: Map<String, List<String>>,
     ): T? {
+        val proxy = proxyServer()
+        if (proxy != null) {
+            val body = withCipher(proxy) { proxyCipher ->
+                responseBodyOrThrow(
+                    executeSignedViaProxy(proxy, path, params),
+                    proxyCipher,
+                )
+            } ?: return null
+            return body.parseAs<T>()
+        }
         val currentCipher = cipher ?: return null
         return runCatching {
             val entries = canonicalEntries(params)
@@ -1015,6 +1296,16 @@ abstract class Comix :
         pathSegments[4] == "chapters"
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        EditTextPreference(screen.context).apply {
+            key = PREF_PROXY_SERVER
+            title = "Proxy server (comix-proxy)"
+            summary = "Base URL of a comix-proxy instance that mints signed tokens " +
+                "and solves the site's WAF/Cloudflare challenges (e.g. " +
+                "http://192.168.1.10:9191). Leave empty to use the built-in solver."
+            dialogTitle = "Proxy server URL"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_FETCH_CHAPTERS_UNTIL_KNOWN
             title = "Faster chapter list fetching"
@@ -1184,6 +1475,10 @@ abstract class Comix :
         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
         private const val PREF_SCORE_POSITION = "pref_score_position"
         private const val PREF_WAF_COOKIE = "pref_waf_cookie"
+        private const val PREF_CIPHER_MATERIAL = "pref_cipher_material"
+        private const val PREF_PROXY_SERVER = "pref_proxy_server"
+        private const val PREF_PROXY_COOKIE = "pref_proxy_cookie"
+        private const val PREF_PROXY_USER_AGENT = "pref_proxy_user_agent"
 
         private const val DEFAULT_CONTENT_RATING = "suggestive"
         private const val WAF_MAX_ATTEMPTS = 3
@@ -1193,6 +1488,7 @@ abstract class Comix :
         private const val HEX = "0123456789ABCDEF"
         private const val URI_COMPONENT_SAFE_CHARS = "-_.!~*'()"
         private const val TAG_ID_CACHE_SIZE = 50
+        private const val CHALLENGE_PEEK_BYTES = 2048L
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
     }
 }
