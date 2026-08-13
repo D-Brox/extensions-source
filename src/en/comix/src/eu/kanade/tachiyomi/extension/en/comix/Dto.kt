@@ -368,3 +368,9 @@ class ProxyCookiesResponse(
     @SerialName("cf_clearance") val cfClearance: String,
     @SerialName("user_agent") val userAgent: String,
 )
+
+/** Response of the comix-proxy `/decrypt` endpoint. */
+@Serializable
+class ProxyDecryptResponse(
+    val json: String,
+)

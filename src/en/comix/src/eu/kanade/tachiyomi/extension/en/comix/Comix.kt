@@ -176,7 +176,7 @@ abstract class Comix :
         params: Map<String, List<String>>,
         forceRefresh: Boolean = false,
     ): ProxySignResponse? {
-        val qs = ComixCrypto.canonicalizes(params)
+        val qs = canonicalizes(params)
         val url = proxy.trimEnd('/') +
             "/sign?path=" + URLEncoder.encode(path, "UTF-8") +
             "&qs=" + URLEncoder.encode(qs, "UTF-8") +
@@ -192,15 +192,32 @@ abstract class Comix :
         }.getOrNull()?.also { saveProxySession(it) }
     }
 
-    /** Fetches the proxy's current cipher material (`/material`, `{s:[],k:[]}`). */
-    private fun proxyMaterial(proxy: String): ComixMaterial? {
-        val url = proxy.trimEnd('/') + "/material"
+    /**
+     * Builds the canonical, sorted, indexed query string exactly like the site's
+     * serializer: keys sorted, list values expanded to `key[i]=value`, single
+     * values emitted as `key=value`, values URL-encoded like JS
+     * `encodeURIComponent`.
+     */
+    private fun canonicalizes(params: Map<String, List<String>>): String = buildList {
+        for (key in params.keys.sorted()) {
+            val entry = params.getValue(key)
+            if (entry.size == 1) {
+                add("$key=${encodeURIComponent(entry[0])}")
+            } else {
+                entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
+            }
+        }
+    }.joinToString("&")
+
+    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt`. */
+    private fun proxyDecrypt(proxy: String, e: String): String? {
+        val url = proxy.trimEnd('/') + "/decrypt?e=" + URLEncoder.encode(e, "UTF-8")
         return runCatching {
             client.newCall(GET(url, headers)).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     null
                 } else {
-                    resp.body.string().let { ComixMaterial.tryFromJson(it) }
+                    resp.parseAs<ProxyDecryptResponse>().json
                 }
             }
         }.getOrNull()
@@ -980,64 +997,34 @@ abstract class Comix :
 
     // ====================== Native signed API =========================
     // The /api/v1/* endpoints require every request to carry a `_` token minted
-    // with the site's live cipher material (see ComixMaterial), which comes from
-    // the proxy server; responses are plaintext JSON. Native calls are a cheap
-    // alternative to booting the SPA in a WebView; a signature rejection means
-    // the site rotated its material, so the cache is dropped, the material is
-    // re-fetched from the proxy, and the call retried once before falling back
-    // to the WebView path.
+    // by the proxy server (which holds the site's live cipher material);
+    // responses are plaintext JSON, or an `"e"` envelope that the proxy decrypts
+    // on request. Native calls are a cheap alternative to booting the SPA in a
+    // WebView; a signature rejection (403 "Invalid/Missing token") or an
+    // undecryptable envelope means the site rotated its material, so the proxy
+    // re-extracts it and the call is retried once before falling back to the
+    // WebView path.
 
     private class CipherRotatedException(message: String) : Exception(message)
 
-    private fun cachedMaterial(): ComixMaterial? = preferences.getString(PREF_CIPHER_MATERIAL, null)
-        ?.let { ComixMaterial.tryFromJson(it) }
-
-    private fun cacheMaterial(material: ComixMaterial) {
-        preferences.edit().putString(PREF_CIPHER_MATERIAL, material.toJsonString()).apply()
-    }
-
-    private fun clearCachedMaterial() {
-        preferences.edit().remove(PREF_CIPHER_MATERIAL).apply()
-    }
-
     /**
-     * Runs [block] with the cached (or freshly fetched) cipher, persisting the
-     * material only after it produced a valid response. A signature rejection
-     * (the site rotated its material) clears the cache, re-fetches once, and
-     * retries; any other failure returns null so callers fall back to WebView.
-     *
-     * Material always comes from the proxy server: the extension no longer
-     * extracts the cipher bundles itself, and a rotation triggers a proxy-side
-     * re-extraction.
+     * Runs [block] against the proxy-minted API, retrying once with a forced
+     * material refresh when the site rotated its material. Any other failure
+     * returns null so callers fall back to WebView.
      */
-    private fun <T> withCipher(proxy: String, block: (ComixCipher) -> T?): T? {
-        var material = cachedMaterial()
-        if (material == null) {
-            material = proxyMaterial(proxy)
-        }
-        if (material == null) {
-            return null
-        }
-
-        try {
-            val result = block(material.toCipher())
-            cacheMaterial(material)
-            return result
+    private fun <T> withProxy(block: () -> T): T? {
+        val proxy = proxyServer() ?: return null
+        return try {
+            block()
         } catch (e: CipherRotatedException) {
-            clearCachedMaterial()
             refreshProxyMaterial(proxy)
-            val fresh = proxyMaterial(proxy) ?: return null
-            val result = try {
-                block(fresh.toCipher())
+            try {
+                block()
             } catch (e2: Exception) {
                 null
             }
-            if (result != null) {
-                cacheMaterial(fresh)
-            }
-            return result
         } catch (e: Exception) {
-            return null
+            null
         }
     }
 
@@ -1092,7 +1079,7 @@ abstract class Comix :
         return GET(builder.build(), headers)
     }
 
-    private fun responseBodyOrThrow(response: Response, cipher: ComixCipher): String {
+    private fun responseBodyOrThrow(response: Response): String {
         val body = response.body.string()
         response.close()
         if (response.code == 403 &&
@@ -1106,20 +1093,20 @@ abstract class Comix :
         if (!response.isSuccessful) {
             throw Exception("API returned ${response.code}")
         }
-        return decodeSignal(body, cipher)
+        return decodeSignal(body)
     }
 
-    /** Passes plaintext responses through; decrypts an `"e"` envelope if present. */
-    private fun decodeSignal(body: String, cipher: ComixCipher): String {
+    /** Passes plaintext responses through; asks the proxy to decrypt an `"e"` envelope if present. */
+    private fun decodeSignal(body: String): String {
         val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
             ?: return body
         val e = root["e"] as? JsonPrimitive ?: return body
-        val decrypted = cipher.decrypt(e.content)
-        val parsed = runCatching { decrypted.parseAs<JsonObject>() }.getOrNull()
+        val decrypted = proxyServer()?.let { proxyDecrypt(it, e.content) }
+        val parsed = runCatching { decrypted?.parseAs<JsonObject>() }.getOrNull()
         if (parsed == null) {
-            throw CipherRotatedException(decrypted.take(160))
+            throw CipherRotatedException((decrypted ?: "decrypt failed").take(160))
         }
-        return decrypted
+        return decrypted!!
     }
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
@@ -1130,11 +1117,8 @@ abstract class Comix :
     ): T? {
         val proxy = proxyServer()
         if (proxy != null) {
-            val body = withCipher(proxy) { proxyCipher ->
-                responseBodyOrThrow(
-                    executeSignedViaProxy(proxy, path, params),
-                    proxyCipher,
-                )
+            val body = withProxy {
+                responseBodyOrThrow(executeSignedViaProxy(proxy, path, params))
             } ?: return null
             return body.parseAs<T>()
         }
@@ -1475,7 +1459,6 @@ abstract class Comix :
         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
         private const val PREF_SCORE_POSITION = "pref_score_position"
         private const val PREF_WAF_COOKIE = "pref_waf_cookie"
-        private const val PREF_CIPHER_MATERIAL = "pref_cipher_material"
         private const val PREF_PROXY_SERVER = "pref_proxy_server"
         private const val PREF_PROXY_COOKIE = "pref_proxy_cookie"
         private const val PREF_PROXY_USER_AGENT = "pref_proxy_user_agent"
