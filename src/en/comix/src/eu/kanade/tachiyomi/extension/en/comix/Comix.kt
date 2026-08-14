@@ -1058,8 +1058,6 @@ abstract class Comix :
     }
 
     private fun Response.isApiChallenge(): Boolean {
-        if (isSuccessful && code != 302) return false
-        if (code == 401) return false
         val body = peekBody(CHALLENGE_PEEK_BYTES).string()
         return body.contains("captcha_required") ||
             body.contains("Security check") ||
