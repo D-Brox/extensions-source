@@ -194,17 +194,18 @@ abstract class Comix :
 
     /**
      * Builds the canonical, sorted, indexed query string exactly like the site's
-     * serializer: keys sorted, list values expanded to `key[i]=value`, single
-     * values emitted as `key=value`, values URL-encoded like JS
-     * `encodeURIComponent`.
+     * serializer: keys sorted, `key[]` arrays expanded to `key[i]=value`, single
+     * values emitted as `key=value`, values emitted raw. The site mints tokens
+     * over the decoded params (colons, spaces, commas, etc. are not
+     * percent-escaped in the canonical), so values are used verbatim here.
      */
     private fun canonicalizes(params: Map<String, List<String>>): String = buildList {
-        for (key in params.keys.sorted()) {
-            val entry = params.getValue(key)
-            if (entry.size == 1) {
-                add("$key=${encodeURIComponent(entry[0])}")
+        for ((key, values) in params.entries.sortedBy { it.key }) {
+            val name = key.removeSuffix("[]")
+            if (values.size == 1 && !key.endsWith("[]")) {
+                add("$name=${values[0]}")
             } else {
-                entry.forEachIndexed { i, v -> add("$key[$i]=${encodeURIComponent(v)}") }
+                values.forEachIndexed { i, v -> add("$name[$i]=$v") }
             }
         }
     }.joinToString("&")
@@ -1078,10 +1079,11 @@ abstract class Comix :
         params.entries
             .sortedBy { it.key }
             .forEach { (key, values) ->
-                if (values.size == 1) {
-                    builder.addQueryParameter(key, values[0])
+                val name = key.removeSuffix("[]")
+                if (values.size == 1 && !key.endsWith("[]")) {
+                    builder.addQueryParameter(name, values[0])
                 } else {
-                    values.forEachIndexed { i, v -> builder.addQueryParameter("$key[$i]", v) }
+                    values.forEachIndexed { i, v -> builder.addQueryParameter("$name[$i]", v) }
                 }
             }
         builder.addQueryParameter("_", token)
