@@ -230,6 +230,11 @@ abstract class Comix :
         }
     }
 
+    /** Ensures the proxy has material, extracting only when none is on disk. */
+    private fun ensureProxyMaterial(proxy: String): Boolean = runCatching {
+        client.newCall(POST(proxy.trimEnd('/') + "/load-material")).execute().use { it.isSuccessful }
+    }.getOrDefault(false)
+
     /**
      * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
      * is set (e.g. a request just came back as the challenge page) or none is
@@ -1029,11 +1034,15 @@ abstract class Comix :
     }
 
     /**
-     * Executes a proxy-backed signed call: mints the token via `/sign`, builds
-     * the URL with the same canonical param ordering, and retries once with a
-     * forced cookie refresh when the server answers with a challenge.
+     * Executes a proxy-backed signed call: ensures material is loaded, mints
+     * the token via `/sign`, builds the URL with the same canonical param
+     * ordering, and retries once with a forced cookie refresh when the server
+     * answers with a challenge.
      */
     private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
+        if (!ensureProxyMaterial(proxy)) {
+            throw Exception("Proxy material not available")
+        }
         val sign = proxySign(proxy, path, params)
             ?: throw Exception("Proxy sign failed")
         var response = client.newCall(signedRequest(path, params, sign.token)).execute()
