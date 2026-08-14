@@ -210,11 +210,12 @@ abstract class Comix :
         }
     }.joinToString("&")
 
-    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt`. */
+    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt` (POST). */
     private fun proxyDecrypt(proxy: String, e: String): String? {
-        val url = proxy.trimEnd('/') + "/decrypt?e=" + URLEncoder.encode(e, "UTF-8")
+        val url = proxy.trimEnd('/') + "/decrypt"
         return runCatching {
-            client.newCall(GET(url, headers)).execute().use { resp ->
+            val body = ProxyDecryptRequest(e).toJsonRequestBody()
+            client.newCall(POST(url, headers, body)).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     null
                 } else {
@@ -1057,7 +1058,7 @@ abstract class Comix :
     }
 
     private fun Response.isApiChallenge(): Boolean {
-        if (isSuccessful) return false
+        if (isSuccessful && code != 302) return false
         if (code == 401) return false
         val body = peekBody(CHALLENGE_PEEK_BYTES).string()
         return body.contains("captcha_required") ||

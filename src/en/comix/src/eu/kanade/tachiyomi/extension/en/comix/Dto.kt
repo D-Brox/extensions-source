@@ -374,3 +374,9 @@ class ProxyCookiesResponse(
 class ProxyDecryptResponse(
     val json: String,
 )
+
+/** Request body of the comix-proxy `/decrypt` endpoint. */
+@Serializable
+class ProxyDecryptRequest(
+    val e: String,
+)
