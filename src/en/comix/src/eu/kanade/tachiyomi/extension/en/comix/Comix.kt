@@ -116,15 +116,9 @@ abstract class Comix :
     // "main" image is a circle at the correct orientation and the "thumb" is its
     // rotated center sub-image; the server accepts the clockwise angle that fixes
     // the thumb and answers with a `waf_pass` cookie that all requests must carry.
-    private var cachedWafCookie: String? = null
-
-    private fun storedWafCookie(): String? {
-        cachedWafCookie?.let { return it }
-        return preferences.getString(PREF_WAF_COOKIE, null)?.also { cachedWafCookie = it }
-    }
+    private fun storedWafCookie(): String? = preferences.getString(PREF_WAF_COOKIE, null)
 
     private fun saveWafCookie(cookie: String?) {
-        cachedWafCookie = cookie
         preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
     }
 
@@ -135,30 +129,19 @@ abstract class Comix :
     // (`cf_clearance`) via FlareSolverr, and returns the UA it solved with
     // (cf_clearance is UA-bound, so the extension must echo it). Everything is
     // fetched through the cleared client and cached here.
-    private var cachedProxyCookie: String? = null
-    private var cachedProxyUserAgent: String? = null
-
     private fun proxyServer(): String? = preferences.getString(PREF_PROXY_SERVER, null)
         ?.trim()
         ?.takeIf { it.isNotBlank() }
 
-    private fun storedProxyCookie(): String? {
-        cachedProxyCookie?.let { return it }
-        return preferences.getString(PREF_PROXY_COOKIE, null)?.also { cachedProxyCookie = it }
-    }
+    private fun storedProxyCookie(): String? = preferences.getString(PREF_PROXY_COOKIE, null)
 
-    private fun storedProxyUserAgent(): String? {
-        cachedProxyUserAgent?.let { return it }
-        return preferences.getString(PREF_PROXY_USER_AGENT, null)?.also { cachedProxyUserAgent = it }
-    }
+    private fun storedProxyUserAgent(): String? = preferences.getString(PREF_PROXY_USER_AGENT, null)
 
-    private fun saveProxySession(sign: ProxySignResponse) {
-        val cookie = "cf_clearance=${sign.cfClearance}; waf_pass=${sign.wafPass}"
-        cachedProxyCookie = cookie
-        cachedProxyUserAgent = sign.userAgent
+    private fun saveProxySession(cfClearance: String, wafPass: String, userAgent: String) {
+        val cookie = "cf_clearance=$cfClearance; waf_pass=$wafPass"
         preferences.edit()
             .putString(PREF_PROXY_COOKIE, cookie)
-            .putString(PREF_PROXY_USER_AGENT, sign.userAgent)
+            .putString(PREF_PROXY_USER_AGENT, userAgent)
             .apply()
         runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
     }
@@ -182,14 +165,14 @@ abstract class Comix :
             "&qs=" + URLEncoder.encode(qs, "UTF-8") +
             if (forceRefresh) "&force=1" else ""
         return runCatching {
-            client.newCall(GET(url, headers)).execute().use { resp ->
+            client.newCall(GET(url)).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     null
                 } else {
                     resp.parseAs<ProxySignResponse>()
                 }
             }
-        }.getOrNull()?.also { saveProxySession(it) }
+        }.getOrNull()?.also { saveProxySession(it.cfClearance, it.wafPass, it.userAgent) }
     }
 
     /**
@@ -199,23 +182,14 @@ abstract class Comix :
      * over the decoded params (colons, spaces, commas, etc. are not
      * percent-escaped in the canonical), so values are used verbatim here.
      */
-    private fun canonicalizes(params: Map<String, List<String>>): String = buildList {
-        for ((key, values) in params.entries.sortedBy { it.key }) {
-            val name = key.removeSuffix("[]")
-            if (values.size == 1 && !key.endsWith("[]")) {
-                add("$name=${values[0]}")
-            } else {
-                values.forEachIndexed { i, v -> add("$name[$i]=$v") }
-            }
-        }
-    }.joinToString("&")
+    private fun canonicalizes(params: Map<String, List<String>>): String = canonicalEntries(params).joinToString("&") { (name, value) -> "$name=$value" }
 
     /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt` (POST). */
     private fun proxyDecrypt(proxy: String, e: String): String? {
         val url = proxy.trimEnd('/') + "/decrypt"
         return runCatching {
             val body = ProxyDecryptRequest(e).toJsonRequestBody()
-            client.newCall(POST(url, headers, body)).execute().use { resp ->
+            client.newCall(POST(url, body = body)).execute().use { resp ->
                 if (!resp.isSuccessful) {
                     null
                 } else {
@@ -335,19 +309,12 @@ abstract class Comix :
             return
         }
         val cookies = runCatching {
-            client.newCall(GET(proxy.trimEnd('/') + "/cookies?force=1", headers)).execute().use { resp ->
+            client.newCall(GET(proxy.trimEnd('/') + "/cookies?force=1")).execute().use { resp ->
                 if (resp.isSuccessful) resp.parseAs<ProxyCookiesResponse>() else null
             }
         }.getOrNull()
         if (cookies != null) {
-            saveProxySession(
-                ProxySignResponse(
-                    token = "",
-                    wafPass = cookies.wafPass,
-                    cfClearance = cookies.cfClearance,
-                    userAgent = cookies.userAgent,
-                ),
-            )
+            saveProxySession(cookies.cfClearance, cookies.wafPass, cookies.userAgent)
         }
     }
 
@@ -625,10 +592,8 @@ abstract class Comix :
         synchronized(tagIdCache) { tagIdCache[cacheKey] }?.let { return it }
 
         val url = apiUrl.toHttpUrl().newBuilder()
-            .addPathSegment("tags")
-            .addPathSegment("search")
             .addQueryParameter("type", type)
-            .addQueryParameter("q", name)
+            .addQueryParameter("keyword", name)
             .build()
 
         val ids = runCatching {
@@ -989,6 +954,7 @@ abstract class Comix :
                         addQueryParameter("v3", null)
                     }
                 }.build().toString()
+
                 isLegacyScramble -> "$full#scrambled"
                 else -> full
             }
@@ -1075,16 +1041,7 @@ abstract class Comix :
     ): Request {
         val builder = baseUrl.toHttpUrl().newBuilder()
             .addPathSegments(path.trimStart('/'))
-        params.entries
-            .sortedBy { it.key }
-            .forEach { (key, values) ->
-                val name = key.removeSuffix("[]")
-                if (values.size == 1 && !key.endsWith("[]")) {
-                    builder.addQueryParameter(name, values[0])
-                } else {
-                    values.forEachIndexed { i, v -> builder.addQueryParameter("$name[$i]", v) }
-                }
-            }
+        canonicalEntries(params).forEach { (name, value) -> builder.addQueryParameter(name, value) }
         builder.addQueryParameter("_", token)
         return GET(builder.build(), headers)
     }
@@ -1111,12 +1068,8 @@ abstract class Comix :
         val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
             ?: return body
         val e = root["e"] as? JsonPrimitive ?: return body
-        val decrypted = proxyServer()?.let { proxyDecrypt(it, e.content) }
-        val parsed = runCatching { decrypted?.parseAs<JsonObject>() }.getOrNull()
-        if (parsed == null) {
-            throw CipherRotatedException((decrypted ?: "decrypt failed").take(160))
-        }
-        return decrypted!!
+        return proxyServer()?.let { proxyDecrypt(it, e.content) }
+            ?: throw CipherRotatedException("decrypt failed")
     }
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
@@ -1371,7 +1324,8 @@ abstract class Comix :
         EditTextPreference(screen.context).apply {
             key = PREF_SCANLATOR_BLACKLIST
             title = "Scanlator Blacklist"
-            summary = "Filter out chapters from specific groups. Comma-separated list of group names or group IDs (e.g., 'Violet Scans, 307')."
+            summary =
+                "Filter out chapters from specific groups. Comma-separated list of group names or group IDs (e.g., 'Violet Scans, 307')."
             dialogTitle = "Exclude groups"
             setDefaultValue("")
         }.let(screen::addPreference)
