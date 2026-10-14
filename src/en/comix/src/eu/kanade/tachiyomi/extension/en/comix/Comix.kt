@@ -665,6 +665,10 @@ abstract class Comix :
     ): String {
         val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
         val timeoutDeadline = AtomicLong(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
+        // A site request pushes the deadline out so a slow flow is not cut short, but the WebView
+        // itself is opened with no timeout: a page that keeps asking, which is what a challenge
+        // interstitial does, would otherwise reset the clock for good and never be given up on
+        val hardDeadline = System.nanoTime() + HARD_CEILING_SECONDS.seconds.inWholeNanoseconds
         val dataRequests = AtomicInteger()
         val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) {
             (1..(10..20).random())
@@ -692,7 +696,8 @@ abstract class Comix :
                 if (isData) dataRequests.incrementAndGet()
                 if (requestUrl.isChapterListRequest()) chapterListPacer.waitForSlot()
                 if (isData || requestUrl.encodedPath.startsWith(WAF_PATH)) {
-                    timeoutDeadline.set(System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds)
+                    val extended = System.nanoTime() + waitSeconds.seconds.inWholeNanoseconds
+                    timeoutDeadline.set(minOf(extended, hardDeadline))
                 }
                 val allowed = requestUrl.host == baseUrlHost ||
                     requestUrl.host.endsWith(".$baseUrlHost") ||
@@ -933,6 +938,9 @@ abstract class Comix :
         private const val DEFAULT_CONTENT_RATING = "suggestive"
         private const val WEBVIEW_TIMEOUT_SECONDS = 120L
         private const val DATA_REQUEST_WAIT_SECONDS = 30L
+
+        /** Ceiling on how far the sliding request timeout may push a WebView run out. */
+        private const val HARD_CEILING_SECONDS = 120L
         private const val SCRIPT_RETRY_INTERVAL_MS = 100L
         private const val MAX_CHAPTER_PAGES = 1000
         private val chapterListPacer = RequestPacer(intervalMs = 3000)
