@@ -28,6 +28,9 @@ import keiyoushi.utils.long
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
 import keiyoushi.utils.string
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -548,12 +551,28 @@ abstract class Comix :
         knownIds: List<Int>,
     ): ChapterList {
         val mangaId = manga.url.removePrefix("/").substringBefore('-')
-        val payload = runInWebView(document, { it.isChapterListRequest() }) { passPayloadName, rejectName ->
+        val payload = runInWebView(
+            document = document,
+            isDataRequest = { it.isChapterListRequest() },
+            onHeldRequest = ::fetchHeldChapterPage,
+        ) { passPayloadName, rejectName ->
             "(${asset("capture_items.js")})((${asset("chapter_list.js")})(" +
                 "${knownIds.joinToString(",", "[", "]")}, ${JSONObject.quote(mangaId)}, ${JSONObject.quote("/title/$mangaId-")}, " +
                 "$MAX_CHAPTER_PAGES, window.$passPayloadName, window.$rejectName));"
         }
         return payload.parseAs<ChapterList>()
+    }
+
+    /**
+     * Performs a request the page has already built and signed, so it goes out natively instead of
+     * through the page, and hands the body back for the site to decrypt as if it were its own.
+     */
+    private suspend fun fetchHeldChapterPage(url: HttpUrl): String? {
+        val path = url.encodedPath.substringAfterLast('/')
+        val response = runCatching { client.get(url, ensureSuccess = false) }.getOrNull() ?: return null
+        val body = runCatching { response.body?.string() }.getOrNull() ?: return null
+        println("Comix token: $path natively -> HTTP ${response.code}, ${body.length} bytes")
+        return body.takeIf { response.isSuccessful }
     }
 
     private fun selectChapters(
@@ -661,6 +680,7 @@ abstract class Comix :
         document: Document,
         isDataRequest: ((HttpUrl) -> Boolean)? = null,
         buildScript: ((passPayloadName: String) -> String)? = null,
+        onHeldRequest: (suspend (HttpUrl) -> String?)? = null,
         pageScript: (passPayloadName: String, rejectName: String) -> String,
     ): String {
         val waitSeconds = if (isDataRequest != null) DATA_REQUEST_WAIT_SECONDS else WEBVIEW_TIMEOUT_SECONDS
@@ -670,7 +690,8 @@ abstract class Comix :
         // interstitial does, would otherwise reset the clock for good and never be given up on
         val hardDeadline = System.nanoTime() + HARD_CEILING_SECONDS.seconds.inWholeNanoseconds
         val dataRequests = AtomicInteger()
-        val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) {
+        val scope = CoroutineScope(currentCoroutineContext())
+        val (bridgeName, errorBridgeName, passPayloadName, rejectName, heldBridgeName) = List(5) {
             (1..(10..20).random())
                 .map { (('a'..'z') + ('A'..'Z')).random() }
                 .joinToString("")
@@ -712,6 +733,29 @@ abstract class Comix :
             jsBridge(bridgeName) { resolve(it) }
             jsBridge(errorBridgeName) { reject(Exception(it)) }
 
+            // Requests the page would have sent are held instead, performed natively, and handed
+            // back into the same request so the site reads them as its own
+            if (onHeldRequest != null) {
+                jsBridge(heldBridgeName) { raw ->
+                    // The page holds its own URL string, so it is handed back verbatim; the native
+                    // fetch needs it absolute
+                    val absolute = raw.toHttpUrlOrNull()
+                        ?: baseUrl.toHttpUrl().resolve(raw)?.takeIf { it.isHttps }
+                        ?: return@jsBridge
+                    scope.launch {
+                        val body = runCatching { onHeldRequest(absolute) }.getOrNull()
+                        val quoted = JSONObject.quote(raw)
+                        evaluateJs(
+                            if (body != null) {
+                                "window.__comixDeliver($quoted, ${JSONObject.quote(body)})"
+                            } else {
+                                "window.__comixFail($quoted, 'native request failed')"
+                            },
+                        )
+                    }
+                }
+            }
+
             val captureScript = buildScript?.invoke(passPayloadName)
             if (captureScript != null) {
                 onPageStarted { evaluateJs(captureScript) }
@@ -733,6 +777,7 @@ abstract class Comix :
             val bootstrapScript = """
                 window.$passPayloadName = payload => window.$bridgeName.post(payload);
                 window.$rejectName = message => window.$errorBridgeName.post(message);
+                ${if (onHeldRequest != null) "window.__comixOnHeld = url => window.$heldBridgeName.post(url);${asset("chapter_token.js")}" else ""}
                 ${pageScript(passPayloadName, rejectName)}
             """.trimIndent()
             val html = document.clone().apply {
