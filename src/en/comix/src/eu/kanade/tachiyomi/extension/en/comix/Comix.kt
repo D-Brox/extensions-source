@@ -137,13 +137,15 @@ abstract class Comix :
 
     private fun storedProxyUserAgent(): String? = preferences.getString(PREF_PROXY_USER_AGENT, null)
 
-    private fun saveProxySession(cfClearance: String, wafPass: String, userAgent: String) {
-        val cookie = "cf_clearance=$cfClearance; waf_pass=$wafPass"
+    private fun saveProxySession(cookie: String?, cfClearance: String, wafPass: String, userAgent: String) {
+        // Prefer the proxy's own jar: cf_clearance and waf_pass alone are not the whole
+        // set of cookies the site expects, so fall back to them only for older proxies
+        val jar = cookie?.takeIf { it.isNotBlank() } ?: "cf_clearance=$cfClearance; waf_pass=$wafPass"
         preferences.edit()
-            .putString(PREF_PROXY_COOKIE, cookie)
+            .putString(PREF_PROXY_COOKIE, jar)
             .putString(PREF_PROXY_USER_AGENT, userAgent)
             .apply()
-        runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
+        runCatching { CookieManager.getInstance().setCookie(baseUrl, jar) }
     }
 
     /**
@@ -172,7 +174,7 @@ abstract class Comix :
                     resp.parseAs<ProxySignResponse>()
                 }
             }
-        }.getOrNull()?.also { saveProxySession(it.cfClearance, it.wafPass, it.userAgent) }
+        }.getOrNull()?.also { saveProxySession(it.cookie, it.cfClearance, it.wafPass, it.userAgent) }
     }
 
     /**
@@ -314,7 +316,7 @@ abstract class Comix :
             }
         }.getOrNull()
         if (cookies != null) {
-            saveProxySession(cookies.cfClearance, cookies.wafPass, cookies.userAgent)
+            saveProxySession(cookies.cookie, cookies.cfClearance, cookies.wafPass, cookies.userAgent)
         }
     }
 

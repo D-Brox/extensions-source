@@ -359,6 +359,9 @@ class ProxySignResponse(
     @SerialName("waf_pass") val wafPass: String,
     @SerialName("cf_clearance") val cfClearance: String,
     @SerialName("user_agent") val userAgent: String,
+    // The proxy's whole cookie jar. The site also sets a session cookie, and sending
+    // cf_clearance on its own leaves every request on Cloudflare's challenge page.
+    val cookie: String? = null,
 )
 
 /** Response of the comix-proxy `/cookies` endpoint. */
@@ -367,6 +370,8 @@ class ProxyCookiesResponse(
     @SerialName("waf_pass") val wafPass: String,
     @SerialName("cf_clearance") val cfClearance: String,
     @SerialName("user_agent") val userAgent: String,
+    // The proxy's whole cookie jar; see ProxySignResponse.cookie
+    val cookie: String? = null,
 )
 
 /** Response of the comix-proxy `/decrypt` endpoint. */
