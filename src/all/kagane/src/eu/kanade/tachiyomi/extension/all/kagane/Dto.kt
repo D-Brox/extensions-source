@@ -6,8 +6,7 @@ import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import org.jsoup.Jsoup
-import java.text.SimpleDateFormat
-import java.util.Locale
+import kotlin.time.Instant
 
 @Serializable
 class GenreDto(
@@ -119,8 +118,6 @@ class DetailsDto(
     val tags: List<Tag> = emptyList(),
     @SerialName("series_alternate_titles")
     val seriesAlternateTitles: List<AlternateTitle> = emptyList(),
-    @SerialName("series_books")
-    val seriesBooks: List<ChapterDto.Book> = emptyList(),
     @SerialName("edition_info")
     val editionInfo: String? = null,
     @SerialName("tracker_id")
@@ -218,20 +215,17 @@ class DetailsDto(
 
 @Serializable
 class ChapterDto(
-    @SerialName("series_books")
-    val seriesBooks: List<Book>,
+    val items: List<Book>,
+    @SerialName("next_cursor")
+    val nextCursor: String? = null,
 ) {
     @Serializable
     class Book(
         @SerialName("book_id")
         val id: String,
-        @SerialName("series_id")
-        val seriesId: String? = null,
         val title: String,
         @SerialName("created_at")
         val createdAt: String?,
-        @SerialName("page_count")
-        val pagesCount: Int,
         @SerialName("sort_no")
         val number: Float,
         @SerialName("chapter_no")
@@ -243,7 +237,7 @@ class ChapterDto(
         fun toSChapter(actualSeriesId: String, useSourceChapterNumber: Boolean = false, chapterTitleMode: String = "optional"): SChapter = SChapter.create().apply {
             url = "/series/$actualSeriesId/reader/$id"
             name = buildChapterName(chapterTitleMode)
-            date_upload = dateFormat.tryParse(createdAt)
+            date_upload = Instant.tryParse(createdAt)
             if (useSourceChapterNumber) {
                 chapter_number = number
             }
@@ -297,9 +291,6 @@ class ChapterDto(
     class Group(
         val title: String,
     )
-    companion object {
-        val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
-    }
 }
 
 @Serializable

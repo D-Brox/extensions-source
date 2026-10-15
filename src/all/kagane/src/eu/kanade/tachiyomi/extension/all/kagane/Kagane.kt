@@ -262,23 +262,47 @@ abstract class Kagane :
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate {
+    ): SMangaUpdate = coroutineScope {
         val seriesId = manga.url
-        val dto = getMangaById(seriesId)
 
-        val updatedManga = parseMangaDetails(dto).apply {
-            if (!dto.trackerId.isNullOrEmpty()) {
-                memo = buildJsonObject {
-                    put("trackerId", dto.trackerId)
+        val details = async { getMangaById(seriesId) }
+        val books = if (fetchChapters) async { getChapterList(seriesId) } else null
+
+        val dto = details.await()
+        val updatedManga = if (fetchDetails) {
+            parseMangaDetails(dto).apply {
+                if (!dto.trackerId.isNullOrEmpty()) {
+                    memo = buildJsonObject {
+                        put("trackerId", dto.trackerId)
+                    }
                 }
             }
+        } else {
+            manga
         }
-        val updatedChapters = parseChapterList(dto, seriesId)
 
-        return SMangaUpdate(updatedManga, updatedChapters)
+        SMangaUpdate(updatedManga, books?.await()?.toSChapterList(dto, seriesId).orEmpty())
     }
 
-    private fun parseChapterList(details: DetailsDto, seriesId: String): List<SChapter> {
+    private suspend fun getChapterList(seriesId: String): List<ChapterDto.Book> {
+        val books = mutableListOf<ChapterDto.Book>()
+        var cursor: String? = null
+
+        do {
+            val url = "$apiUrl/series/$seriesId/books".toHttpUrl().newBuilder().apply {
+                if (cursor != null) addQueryParameter("before", cursor)
+            }.build()
+
+            val dto = client.get(url).parseAs<ChapterDto>()
+            books += dto.items
+            val nextCursor = dto.nextCursor
+            cursor = if (nextCursor != null && nextCursor != cursor) nextCursor else null
+        } while (cursor != null)
+
+        return books
+    }
+
+    private fun List<ChapterDto.Book>.toSChapterList(details: DetailsDto, seriesId: String): List<SChapter> {
         val useSourceChapterNumber = details.format in setOf(
             "Dark Horse Comics",
             "Flame Comics",
@@ -286,7 +310,7 @@ abstract class Kagane :
             "Square Enix Manga",
         )
 
-        return details.seriesBooks.map { book ->
+        return map { book ->
             book.toSChapter(seriesId, useSourceChapterNumber, chapterTitleMode)
         }.reversed()
     }
