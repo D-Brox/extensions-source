@@ -1,10 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.comix
 
 import android.content.SharedPreferences
-import android.graphics.BitmapFactory
-import android.util.Base64
-import android.webkit.CookieManager
-import android.webkit.WebResourceResponse
 import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
@@ -29,14 +25,12 @@ import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.int
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.runWebView
 import keiyoushi.utils.string
 import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import okhttp3.CookieJar
@@ -44,16 +38,12 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
-import okio.Buffer
-import org.json.JSONObject
 import org.jsoup.nodes.Document
-import java.net.URLEncoder
-import java.util.concurrent.atomic.AtomicLong
-import kotlin.time.Duration
-import kotlin.time.Duration.Companion.milliseconds
+import java.io.IOException
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -64,9 +54,6 @@ abstract class Comix :
     private val apiUrl get() = "$baseUrl/api/v1"
     private val preferences: SharedPreferences by getPreferencesLazy()
 
-    @Volatile
-    private var cipher: ComixCipher? = null
-
     private val tagIdCache = object : LinkedHashMap<String, List<String>>(
         TAG_ID_CACHE_SIZE,
         0.75f,
@@ -76,15 +63,27 @@ abstract class Comix :
     }
 
     override fun OkHttpClient.Builder.configureClient() = cookieJar(CookieJar.NO_COOKIES)
+        .connectTimeout(60.seconds)
+        .readTimeout(60.seconds)
+        .callTimeout(60.seconds)
         .addInterceptor(Descrambler.interceptor)
+        .addInterceptor(::altHostFallback)
         .addInterceptor { chain ->
             val request = chain.request()
+            // Image requests carry their alt hosts in a fragment and have no scramble paths
+            // to rewrite, and API traffic must not be rewritten at all.
+            if (
+                request.url.fragment?.startsWith(ALT_HOSTS_FRAGMENT) == true ||
+                request.url.host == baseUrlHost
+            ) {
+                return@addInterceptor chain.proceed(request)
+            }
 
             val response = chain.proceed(request)
             if (response.code != 404) return@addInterceptor response
 
             val url = request.url.toString()
-            val fallbacks = listOf("/i5/", "/si/", "/i/", "/sii/", "/ii/")
+            val fallbacks = listOf("/hi/", "/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/")
                 .map { url.replaceFirst(SCRAMBLE_PATH_FALLBACK_REGEX, it) }
                 .filter { it != url }
 
@@ -98,37 +97,70 @@ abstract class Comix :
             }
             lastResponse
         }
+        .rateLimit(2) { it.host == baseUrlHost }
         .rateLimit(5)
+
+    private val baseUrlHost get() = baseUrl.toHttpUrl().host
+
+    // Image mirrors: the reader walks them in order, so carry them in the fragment and
+    // retry across them here.
+    private fun altHostFallback(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val altHosts = request.url.altHosts()
+        if (altHosts.isEmpty()) return chain.proceed(request)
+
+        val urls = listOf(request.url) + altHosts.mapIndexed { index, host ->
+            request.url.newBuilder()
+                .host(host)
+                .setQueryParameter("r", (index + 1).toString())
+                .build()
+        }
+
+        var failed: Response? = null
+        var error: IOException? = null
+        for (url in urls) {
+            if (failed != null) {
+                failed.close()
+                failed = null
+                runCatching { Thread.sleep(2000) }
+            }
+            try {
+                val response = chain.proceed(request.newBuilder().url(url).build())
+                if (response.isSuccessful) return response
+                failed = response
+            } catch (e: IOException) {
+                if (chain.call().isCanceled()) throw e
+                error = e
+            }
+        }
+        return failed ?: throw error!!
+    }
+
+    private fun HttpUrl.altHosts(): List<String> = fragment
+        ?.takeIf { it.startsWith(ALT_HOSTS_FRAGMENT) }
+        ?.removePrefix(ALT_HOSTS_FRAGMENT)
+        ?.split(',')
+        .orEmpty()
 
     override fun Headers.Builder.configureHeaders() = add("Accept", "*/*")
         .apply {
-            val proxy = proxyServer()
-            if (proxy != null) {
-                storedProxyCookie()?.let { add("Cookie", it) }
-                storedProxyUserAgent()?.let { set("User-Agent", it) }
-            } else {
-                storedWafCookie()?.let { add("Cookie", it) }
-            }
+            // The proxy's cleared jar also carries the site cookie, and cf_clearance is
+            // bound to the user agent it was solved with, so both have to be echoed.
+            val proxy = proxyServer() ?: return@apply
+            storedProxyCookie()?.let { add("Cookie", it) }
+            storedProxyUserAgent()?.let { set("User-Agent", it) }
         }
 
-    // ============================== WAF ==============================
-    // The site serves a rotate-to-align captcha before trusting a client. The
-    // "main" image is a circle at the correct orientation and the "thumb" is its
-    // rotated center sub-image; the server accepts the clockwise angle that fixes
-    // the thumb and answers with a `waf_pass` cookie that all requests must carry.
-    private fun storedWafCookie(): String? = preferences.getString(PREF_WAF_COOKIE, null)
-
-    private fun saveWafCookie(cookie: String?) {
-        preferences.edit().putString(PREF_WAF_COOKIE, cookie).apply()
-    }
-
     // ============================== Proxy ==============================
-    // When a comix-proxy server is configured, the extension offloads both the
-    // cipher material and the WAF/Cloudflare cookies to it. The proxy mints the
-    // `_` token, solves the site's rotate captcha (`waf_pass`) and Cloudflare
-    // (`cf_clearance`) via FlareSolverr, and returns the UA it solved with
-    // (cf_clearance is UA-bound, so the extension must echo it). Everything is
-    // fetched through the cleared client and cached here.
+    // When a comix-proxy server is configured, API calls go through its `/request`
+    // endpoint: the proxy makes the call through the site's own bundle, so it mints the
+    // `_` token, carries the WAF/Cloudflare cookies and unwraps the `{"e": ...}`
+    // envelope, and hands back plain JSON. The extension then holds neither a token nor
+    // a cipher key.
+    //
+    // Manga details and related titles are still read from the site's own HTML rather than
+    // the API, so the proxy's cookie jar and the user agent it was solved with are cached
+    // here and echoed on those requests; cf_clearance is bound to that user agent.
     private fun proxyServer(): String? = preferences.getString(PREF_PROXY_SERVER, null)
         ?.trim()
         ?.takeIf { it.isNotBlank() }
@@ -137,44 +169,26 @@ abstract class Comix :
 
     private fun storedProxyUserAgent(): String? = preferences.getString(PREF_PROXY_USER_AGENT, null)
 
-    private fun saveProxySession(cookie: String?, cfClearance: String, wafPass: String, userAgent: String) {
-        // Prefer the proxy's own jar: cf_clearance and waf_pass alone are not the whole
-        // set of cookies the site expects, so fall back to them only for older proxies
-        val jar = cookie?.takeIf { it.isNotBlank() } ?: "cf_clearance=$cfClearance; waf_pass=$wafPass"
+    private fun saveProxySession(cookie: String?, cfClearance: String, userAgent: String) {
+        val jar = cookie?.takeIf { it.isNotBlank() } ?: "cf_clearance=$cfClearance"
         preferences.edit()
             .putString(PREF_PROXY_COOKIE, jar)
             .putString(PREF_PROXY_USER_AGENT, userAgent)
             .apply()
-        runCatching { CookieManager.getInstance().setCookie(baseUrl, jar) }
     }
 
     /**
-     * Calls `{proxy}/sign` for the signed [path] with canonicalized [params] and
-     * returns the minted token plus the proxy's current cookies/UA. The qs is
-     * the canonical (raw-bracket) form the site's serializer produces; the proxy
-     * mints the token over it and the URL is later rebuilt with the same sorted
-     * params, so ordering matches what the server validates.
+     * Asks the proxy for an API path with canonicalized [params] and returns the body's
+     * plain JSON. `qs` is the canonical (raw-bracket) form the site's serializer produces;
+     * the proxy signs over it, so ordering has to match what the server validates.
      */
-    private fun proxySign(
-        proxy: String,
-        path: String,
-        params: Map<String, List<String>>,
-        forceRefresh: Boolean = false,
-    ): ProxySignResponse? {
-        val qs = canonicalizes(params)
-        val url = proxy.trimEnd('/') +
-            "/sign?path=" + URLEncoder.encode(path, "UTF-8") +
-            "&qs=" + URLEncoder.encode(qs, "UTF-8") +
-            if (forceRefresh) "&force=1" else ""
+    private fun proxyRequest(proxy: String, path: String, params: Map<String, List<String>>): String? {
+        val body = ProxyRequestBody(path, canonicalizes(params)).toJsonRequestBody()
         return runCatching {
-            client.newCall(GET(url)).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    null
-                } else {
-                    resp.parseAs<ProxySignResponse>()
-                }
+            client.newCall(POST(proxy.trimEnd('/') + "/request", body = body)).execute().use { resp ->
+                if (resp.isSuccessful) resp.parseAs<ProxyRequestResponse>().json else null
             }
-        }.getOrNull()?.also { saveProxySession(it.cookie, it.cfClearance, it.wafPass, it.userAgent) }
+        }.getOrNull()
     }
 
     /**
@@ -186,105 +200,25 @@ abstract class Comix :
      */
     private fun canonicalizes(params: Map<String, List<String>>): String = canonicalEntries(params).joinToString("&") { (name, value) -> "$name=$value" }
 
-    /** Decrypts an `"e"` envelope server-side via the proxy's `/decrypt` (POST). */
-    private fun proxyDecrypt(proxy: String, e: String): String? {
-        val url = proxy.trimEnd('/') + "/decrypt"
-        return runCatching {
-            val body = ProxyDecryptRequest(e).toJsonRequestBody()
-            client.newCall(POST(url, body = body)).execute().use { resp ->
-                if (!resp.isSuccessful) {
-                    null
-                } else {
-                    resp.parseAs<ProxyDecryptResponse>().json
-                }
+    /**
+     * Asks the proxy for the jar it is currently using (`/cookies`). Clearing HTML pages
+     * needs it, and the proxy is the only party that can solve Cloudflare.
+     */
+    private fun refreshCookiesOrWaf() {
+        val proxy = proxyServer() ?: return
+        val cookies = runCatching {
+            client.newCall(GET(proxy.trimEnd('/') + "/cookies")).execute().use { resp ->
+                if (resp.isSuccessful) resp.parseAs<ProxyCookiesResponse>() else null
             }
         }.getOrNull()
-    }
-
-    /** Tells the proxy to re-extract material from the live site. */
-    private fun refreshProxyMaterial(proxy: String) {
-        runCatching {
-            client.newCall(POST(proxy.trimEnd('/') + "/refresh-material")).execute().close()
+        if (cookies != null) {
+            saveProxySession(cookies.cookie, cookies.cfClearance, cookies.userAgent)
         }
     }
-
-    /** Ensures the proxy has material, extracting only when none is on disk. */
-    private fun ensureProxyMaterial(proxy: String): Boolean = runCatching {
-        client.newCall(POST(proxy.trimEnd('/') + "/load-material")).execute().use { it.isSuccessful }
-    }.getOrDefault(false)
 
     /**
-     * Returns a valid WAF cookie, solving a new captcha first when [forceRefresh]
-     * is set (e.g. a request just came back as the challenge page) or none is
-     * stored yet. The WebView needs the cookie too, so it is mirrored into the
-     * WebView cookie store.
-     */
-    @Synchronized
-    private fun obtainWafCookie(forceRefresh: Boolean): String? {
-        if (!forceRefresh) {
-            storedWafCookie()?.let { return it }
-        }
-        repeat(WAF_MAX_ATTEMPTS) {
-            trySolveWafChallenge()?.let { cookie ->
-                saveWafCookie(cookie)
-                runCatching { CookieManager.getInstance().setCookie(baseUrl, cookie) }
-                return cookie
-            }
-        }
-        saveWafCookie(null)
-        return null
-    }
-
-    private fun trySolveWafChallenge(): String? {
-        val url = "$baseUrl/@waf/generate"
-        val apiHeaders = headersBuilder()
-            .removeAll("Cookie")
-            .set("Accept", "application/json")
-            .build()
-        return try {
-            val challenge = client.newCall(GET(url, apiHeaders))
-                .execute()
-                .use { it.parseAs<WafChallengeResponse>() }
-            val original = decodeDataUri(challenge.imageBase64)
-            val rotatedCrop = decodeDataUri(challenge.thumbBase64)
-            if (original == null || rotatedCrop == null) {
-                original?.recycle()
-                rotatedCrop?.recycle()
-                return null
-            }
-            try {
-                val angle = RotationEstimator.estimateRotationAngle(original, rotatedCrop)
-                val verify = POST(
-                    "$baseUrl/@waf/verify",
-                    apiHeaders,
-                    WafVerifyRequest(challenge.captchaId, angle % 360).toJsonRequestBody(),
-                )
-                client.newCall(verify).execute().use { response ->
-                    val cookie = response.headers("Set-Cookie")
-                        .firstOrNull { it.startsWith("waf_pass=") }
-                        ?.substringBefore(";")
-                    val success = response.parseAs<WafVerifyResponse>().success
-                    if (success) cookie else null
-                }
-            } finally {
-                original.recycle()
-                rotatedCrop.recycle()
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    private fun decodeDataUri(uri: String): android.graphics.Bitmap? = runCatching {
-        val bytes = Base64.decode(uri.substringAfter(','), Base64.DEFAULT)
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-    }.getOrNull()
-
-    /**
-     * Fetches a page HTML, transparently refreshing the WAF cookie and retrying
-     * once when the server answers with the rotate captcha page instead. In proxy
-     * mode the refresh goes through the proxy (`/cookies?force=1`) which solves
-     * Cloudflare + the site captcha remotely.
+     * Fetches a page HTML, re-solving the proxy's cookies and retrying once when the
+     * server answers with the security check page instead.
      */
     private suspend fun fetchPage(url: HttpUrl): Document = fetchPage(url.toString())
 
@@ -294,30 +228,9 @@ abstract class Comix :
         refreshCookiesOrWaf()
         val retry = client.get(url).asJsoup()
         if (retry.isWafChallenge()) {
-            throw Exception("WAF challenge could not be solved")
+            throw Exception("Security check could not be cleared")
         }
         return retry
-    }
-
-    /**
-     * Refreshes the current WAF session: asks the proxy to re-solve cookies
-     * (`/cookies?force=1`) when a proxy is configured, otherwise solves the
-     * site's rotate captcha natively.
-     */
-    private fun refreshCookiesOrWaf() {
-        val proxy = proxyServer()
-        if (proxy == null) {
-            obtainWafCookie(forceRefresh = true)
-            return
-        }
-        val cookies = runCatching {
-            client.newCall(GET(proxy.trimEnd('/') + "/cookies?force=1")).execute().use { resp ->
-                if (resp.isSuccessful) resp.parseAs<ProxyCookiesResponse>() else null
-            }
-        }.getOrNull()
-        if (cookies != null) {
-            saveProxySession(cookies.cookie, cookies.cfClearance, cookies.wafPass, cookies.userAgent)
-        }
     }
 
     private fun Document.isWafChallenge(): Boolean = selectFirst("title")?.text().orEmpty() == "Security check" ||
@@ -336,153 +249,11 @@ abstract class Comix :
     private suspend fun getMangaListFromBrowse(url: HttpUrl): MangasPage {
         getSigned<SearchResponse>("/api/v1/manga", nativeMangaParams(url))?.let { response ->
             return MangasPage(
-                response.result.items.map { it.toBasicSManga(preferences.posterQuality()) },
-                response.result.hasNextPage(),
+                response.items.map { it.toBasicSManga(preferences.posterQuality()) },
+                response.hasNextPage(),
             )
         }
-
-        val document = fetchPage(url)
-        val contentRating = url.queryParameter("content_rating")
-            ?: preferences.contentRating()
-        val effectiveContentRating = contentRating
-            .split(',')
-            .lastOrNull { it.isNotBlank() }
-            .orEmpty()
-            .ifEmpty { "pornographic" }
-        val expectedKeyword = JSONObject.quote(
-            url.queryParameter("q") ?: url.queryParameter("keyword").orEmpty(),
-        )
-        val searchResponse = document.extractBrowseResponse() ?: runInWebView(
-            document = document,
-            initializationScript = """
-                (function () {
-                    const key = 'settings_v2';
-                    let settings = {};
-                    try {
-                        settings = JSON.parse(localStorage.getItem(key) || '{}');
-                    } catch (e) {}
-                    settings.state = {
-                        ...(settings.state || {}),
-                        contentFilter: '$effectiveContentRating'
-                    };
-                    if (settings.version === undefined) settings.version = 0;
-                    localStorage.setItem(key, JSON.stringify(settings));
-                })();
-            """.trimIndent(),
-            buildScript = { passPayloadName, _ ->
-                """
-                    (function () {
-                        const payloadKey = '__comixBrowsePayload';
-                        const expectedKeyword = $expectedKeyword;
-                        const capture = (parsed, allowEmpty = false) => {
-                            try {
-                                if (parsed && Array.isArray(parsed.items)) {
-                                    parsed = { result: parsed };
-                                }
-                                if (
-                                    parsed &&
-                                    parsed.result &&
-                                    Array.isArray(parsed.result.items) &&
-                                    (allowEmpty || parsed.result.items.length > 0)
-                                ) {
-                                    window[payloadKey] = JSON.stringify(parsed);
-                                    window.$passPayloadName(window[payloadKey]);
-                                    return true;
-                                }
-                            } catch (e) {}
-                            return false;
-                        };
-
-                        if (window[payloadKey]) return window[payloadKey];
-
-                        try {
-                            const raw = document.querySelector('script#initial-data')?.textContent;
-                            const queries = raw && JSON.parse(raw).queries;
-                            if (queries) Object.values(queries).some(capture);
-                        } catch (e) {}
-
-                        if (window[payloadKey]) return window[payloadKey];
-                        if (window.__comixBrowseCaptureInstalled) return null;
-                        window.__comixBrowseCaptureInstalled = true;
-
-                        const captureText = text => {
-                            try {
-                                if (text) capture(JSON.parse(text), true);
-                            } catch (e) {}
-                        };
-
-                        const shouldCaptureUrl = rawUrl => {
-                            try {
-                                const url = new URL(rawUrl || '', window.location.origin);
-                                if (!url.pathname.includes('/api/v1/manga')) return false;
-                                if (!expectedKeyword) return true;
-                                return url.searchParams.get('keyword') === expectedKeyword;
-                            } catch (e) {
-                                return false;
-                            }
-                        };
-
-                        const originalFetch = window.fetch;
-                        if (typeof originalFetch === 'function') {
-                            window.fetch = function () {
-                                return originalFetch.apply(this, arguments).then(response => {
-                                    try {
-                                        const url = response && response.url || '';
-                                        if (shouldCaptureUrl(url)) {
-                                            response.clone().text().then(captureText).catch(() => {});
-                                        }
-                                    } catch (e) {}
-                                    return response;
-                                });
-                            };
-                        }
-
-                        const originalOpen = XMLHttpRequest.prototype.open;
-                        const originalSend = XMLHttpRequest.prototype.send;
-                        XMLHttpRequest.prototype.open = function (method, url) {
-                            this.__comixBrowseUrl = String(url || '');
-                            return originalOpen.apply(this, arguments);
-                        };
-                        XMLHttpRequest.prototype.send = function () {
-                            this.addEventListener('load', function () {
-                                try {
-                                    if (shouldCaptureUrl(this.__comixBrowseUrl)) {
-                                        captureText(this.responseText);
-                                    }
-                                } catch (e) {}
-                            });
-                            return originalSend.apply(this, arguments);
-                        };
-
-                        const originalParse = JSON.parse;
-                        const proxiedParse = new Proxy(originalParse, {
-                            apply(target, thisArg, args) {
-                                const parsed = Reflect.apply(target, thisArg, args);
-                                if (!expectedKeyword) capture(parsed);
-                                return parsed;
-                            }
-                        });
-                        JSON.parse = proxiedParse;
-                        return window[payloadKey] || null;
-                    })();
-                """.trimIndent()
-            },
-        ).parseAs<SearchResponse>()
-
-        val mangaList = searchResponse.result.items.map {
-            it.toBasicSManga(preferences.posterQuality())
-        }
-        return MangasPage(mangaList, searchResponse.result.hasNextPage())
-    }
-
-    private fun Document.extractBrowseResponse(): SearchResponse? {
-        val queries = runCatching { extractInitialQueries() }.getOrNull() ?: return null
-
-        return queries.values.firstNotNullOfOrNull { value ->
-            runCatching { value.parseAs<SearchResponse>() }
-                .getOrNull()
-                ?.takeIf { it.result.items.isNotEmpty() }
-        }
+        throw Exception("Browse list unavailable; is the proxy server configured?")
     }
 
     private fun Document.extractInitialQueries(): JsonObject {
@@ -632,7 +403,7 @@ abstract class Comix :
             fetched
         }
 
-        val nativeChapters = if (fetchChapters && cipher != null) {
+        val nativeChapters = if (fetchChapters && proxyServer() != null) {
             async { getNativeChapterList(manga, latestChapterId) }
         } else {
             null
@@ -641,7 +412,7 @@ abstract class Comix :
         val updatedManga = if (fetchDetails) parseMangaDetails(getDocument()) else manga
         val updatedChapters = if (fetchChapters) {
             val fetched = nativeChapters?.await()
-                ?: getWebViewChapterList(manga, getDocument(), latestChapterId)
+                ?: throw Exception("Chapter list unavailable; is the proxy server configured?")
             mergeChapters(fetched)
         } else {
             chapters
@@ -689,7 +460,7 @@ abstract class Comix :
             ?.value
             ?: return emptyList()
 
-        return related.parseAs<SearchResponse.Items>().items.map {
+        return related.parseAs<SearchResponse>().items.map {
             it.toBasicSManga(preferences.posterQuality())
         }
     }
@@ -702,86 +473,6 @@ abstract class Comix :
             ?.lastOrNull()
             ?.substringBefore("-chapter-")
             ?.toIntOrNull()
-
-    private suspend fun getWebViewChapterList(
-        manga: SManga,
-        document: Document,
-        latestChapterId: Int?,
-    ): List<SChapter> {
-        val mangaSlug = manga.url.removePrefix("/")
-        val mangaId = manga.mangaId() ?: throw Exception("Refresh manga details")
-        val webViewDocument = document.clone()
-        val mainScript = webViewDocument.selectFirst(
-            "script[type=module][src*=\"/dist/main-\"]",
-        )
-        val mainScriptUrl = mainScript?.absUrl("src").orEmpty()
-        if (mainScriptUrl.isNotEmpty()) mainScript?.remove()
-        val payload = runInWebView(
-            document = webViewDocument,
-            buildScript = { passPayloadName, rejectName ->
-                $$"""
-                    (function () {
-                        const payloadKey = '__comixChapterPayload';
-                        const mangaId = $${JSONObject.quote(mangaId)};
-                        const mainScriptUrl = $${JSONObject.quote(mainScriptUrl)};
-                        const latestChapterId = $${latestChapterId ?: "null"};
-                        if (window[payloadKey]) return null;
-                        window[payloadKey] = true;
-
-                        (async () => {
-                            try {
-                                if (!mainScriptUrl) throw new Error('Could not find main bundle');
-                                const mainResponse = await fetch(mainScriptUrl);
-                                if (!mainResponse.ok) throw new Error('Could not load main bundle');
-                                const mainJavaScript = await mainResponse.text();
-                                const environmentFile = mainJavaScript.match(
-                                    /from\s*["']\.\/(env-[^"']+\.js)["']/
-                                )?.[1];
-                                if (!environmentFile) throw new Error('Could not find environment bundle');
-
-                                const importBundle = new Function('url', 'return import(url)');
-                                const environment = await importBundle(
-                                    new URL(environmentFile, mainScriptUrl).href
-                                );
-                                const mangaApi = Object.values(environment).find(value =>
-                                    value &&
-                                    typeof value === 'object' &&
-                                    typeof value.chapters === 'function'
-                                );
-                                if (!mangaApi) throw new Error('Could not find manga API');
-
-                                const items = [];
-                                let page = 1;
-                                while (page <= $${MAX_CHAPTER_PAGES}) {
-                                    const response = await mangaApi.chapters(mangaId, {
-                                        page,
-                                        limit: 100,
-                                        order: { number: 'desc' }
-                                    });
-                                    const pageItems = response?.items;
-                                    if (!Array.isArray(pageItems) || pageItems.length === 0) break;
-
-                                    items.push(...pageItems);
-                                    if (pageItems.some(item => item.id === latestChapterId)) break;
-
-                                    const meta = response.meta || response.pagination || {};
-                                    const lastPage = meta.lastPage || meta.last_page || page;
-                                    if (!(meta.hasNext || page < lastPage)) break;
-                                    page++;
-                                }
-                                window.$${passPayloadName}(JSON.stringify(items));
-                            } catch (error) {
-                                window.$${rejectName}(error);
-                            }
-                        })();
-                        return null;
-                    })();
-                """.trimIndent()
-            },
-        )
-
-        return buildChapters(payload.parseAs(), mangaSlug)
-    }
 
     private fun buildChapters(allChapters: List<Chapter>, mangaSlug: String): List<SChapter> {
         val blacklist = preferences.scanlatorBlacklist()
@@ -844,7 +535,7 @@ abstract class Comix :
     }
 
     private suspend fun getNativeChapterList(manga: SManga, latestChapterId: Int?): List<SChapter>? {
-        if (proxyServer() == null && cipher == null) return null
+        if (proxyServer() == null) return null
         val mangaSlug = getMangaUrl(manga).toHttpUrl().pathSegments.getOrNull(1) ?: return null
         val mangaId = manga.mangaId() ?: return null
         val chapters = mutableListOf<Chapter>()
@@ -853,14 +544,19 @@ abstract class Comix :
             val response = getSigned<ChapterDetailsResponse>(
                 "/api/v1/manga/$mangaId/chapters",
                 mapOf(
-                    "limit" to listOf("100"),
+                    // The site's own reader pages by 20, and so does this. A bigger page is
+                    // not a shortcut: measured against the proxy, limit=100 serves exactly
+                    // one request before the cookie stops answering, while limit=20 serves
+                    // 45+ on the same cookie. So a 500-chapter title costs 25 cheap requests
+                    // on one jar instead of 5 requests each exhausting a jar of its own.
+                    "limit" to listOf("20"),
                     "order[number]" to listOf("desc"),
                     "page" to listOf(page.toString()),
                 ),
             ) ?: return null
-            chapters += response.result.items
-            val reachedKnown = response.result.items.any { it.id == latestChapterId }
-            if (reachedKnown || !response.result.hasNextPage() || response.result.items.isEmpty()) break
+            chapters += response.items
+            val reachedKnown = response.items.any { it.id == latestChapterId }
+            if (reachedKnown || !response.hasNextPage() || response.items.isEmpty()) break
             page++
         }
         return buildChapters(chapters, mangaSlug)
@@ -868,211 +564,56 @@ abstract class Comix :
 
     // V3 grid-scramble pages must NOT send Origin — the server withholds X-Scramble-Seed when
     // Origin is present. Legacy byte-XOR pages need Origin to receive X-Enc-Seed.
+    // Comix image domains block any image request that carries Referer/Origin
+    //
+    // The fragment carries the image mirrors and must survive into the request: it is never
+    // sent to the server, but altHostFallback reads it to retry across them. Dropping it
+    // here silences the retry entirely.
     override fun imageRequest(page: Page): Request {
         val imageUrl = page.imageUrl ?: return super.imageRequest(page)
-        val urlWithoutFragment = imageUrl.substringBefore('#')
-        val imageHost = urlWithoutFragment.toHttpUrlOrNull()?.host.orEmpty()
-        val isScrambled = imageUrl.contains("#scrambled")
-        val isV3 = urlWithoutFragment.toHttpUrlOrNull()?.queryParameterNames?.contains("v3") == true
-        val isLegacyScramble = isScrambled && !isV3
-        val baseUrlHost = baseUrl.toHttpUrl().host
-        val requestHeaders = if (
-            imageHost.isNotEmpty() &&
-            !imageHost.endsWith(baseUrlHost) &&
-            !isLegacyScramble
-        ) {
-            headersBuilder()
-                .removeAll("Origin")
-                .build()
-        } else {
-            headers
-        }
-        return GET(urlWithoutFragment, requestHeaders)
+        val requestHeaders = headersBuilder()
+            .removeAll("Origin")
+            .removeAll("Referer")
+            .build()
+        return GET(imageUrl, requestHeaders)
     }
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        getNativePageList(chapter)?.let { return it }
-
-        val document = client.get(getChapterUrl(chapter)).asJsoup()
-        val payload = runInWebView(
-            document = document,
-            buildScript = { passPayloadName, _ ->
-                """
-                (function () {
-                    const payloadKey = '__comixPagePayload';
-                    const capture = parsed => {
-                        try {
-                            if (parsed && parsed.result && parsed.result.pages) {
-                                window[payloadKey] = JSON.stringify(parsed);
-                                window.$passPayloadName(window[payloadKey]);
-                                return true;
-                            }
-                        } catch (e) {}
-                        return false;
-                    };
-
-                    if (window[payloadKey]) return window[payloadKey];
-
-                    try {
-                        const raw = document.querySelector('script#initial-data')?.textContent;
-                        const queries = raw && JSON.parse(raw).queries;
-                        if (queries) Object.values(queries).some(capture);
-                    } catch (e) {}
-
-                    if (window[payloadKey]) return window[payloadKey];
-                    if (JSON.parse.__comixPageCaptureInstalled) return null;
-                    const originalParse = JSON.parse;
-                    const proxiedParse = new Proxy(originalParse, {
-                        apply(target, thisArg, args) {
-                            const parsed = Reflect.apply(target, thisArg, args);
-                            capture(parsed);
-                            return parsed;
-                        }
-                    });
-                    proxiedParse.__comixPageCaptureInstalled = true;
-                    JSON.parse = proxiedParse;
-                    return window[payloadKey] || null;
-                })();
-                """.trimIndent()
-            },
-        )
-
-        return buildPages(payload.parseAs())
-    }
+    override suspend fun getPageList(chapter: SChapter): List<Page> = getNativePageList(chapter)
+        ?: throw Exception("Page list unavailable; is the proxy server configured?")
 
     private fun buildPages(response: ChapterResponse): List<Page> {
-        val pages = response.result.pages
+        val pages = response.pages
         val base = pages.baseUrl.trimEnd('/')
 
         return pages.items.mapIndexed { index, img ->
-            val full = if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}"
+            val full = (if (img.url.startsWith("http")) img.url else "$base/${img.url.trimStart('/')}").toHttpUrl()
             // V3 pages need the query flag so the server returns grid-scramble headers.
-            // Legacy byte-XOR pages: add #scrambled so imageRequest keeps Origin for x-enc-seed
-            val isV3 = img.s == 1 || full.contains("?v3")
-            val isLegacyScramble = !isV3 && (index + 1) % 4 == 0
-            val url = when {
-                isV3 -> full.toHttpUrl().newBuilder().apply {
-                    if (!full.toHttpUrl().queryParameterNames.contains("v3")) {
-                        addQueryParameter("v3", null)
-                    }
-                }.build().toString()
-
-                isLegacyScramble -> "$full#scrambled"
-                else -> full
-            }
+            val isV3 = img.s == 1 || "v3" in full.queryParameterNames
+            val url = full.newBuilder().apply {
+                if (isV3 && "v3" !in full.queryParameterNames) {
+                    addQueryParameter("v3", null)
+                }
+                val altHosts = pages.altHosts(full.host, index)
+                if (altHosts.isNotEmpty()) fragment(ALT_HOSTS_FRAGMENT + altHosts.joinToString(","))
+            }.build().toString()
             Page(index, imageUrl = url)
         }
     }
 
     private suspend fun getNativePageList(chapter: SChapter): List<Page>? {
-        if (proxyServer() == null && cipher == null) return null
+        if (proxyServer() == null) return null
         val chapterId = chapter.chapterId() ?: return null
         return getSigned<ChapterResponse>("/api/v1/chapters/$chapterId", emptyMap())?.let(::buildPages)
     }
 
-    // ====================== Native signed API =========================
-    // The /api/v1/* endpoints require every request to carry a `_` token minted
-    // by the proxy server (which holds the site's live cipher material);
-    // responses are plaintext JSON, or an `"e"` envelope that the proxy decrypts
-    // on request. Native calls are a cheap alternative to booting the SPA in a
-    // WebView; a signature rejection (403 "Invalid/Missing token") or an
-    // undecryptable envelope means the site rotated its material, so the proxy
-    // re-extracts it and the call is retried once before falling back to the
-    // WebView path.
-
-    private class CipherRotatedException(message: String) : Exception(message)
-
-    /**
-     * Runs [block] against the proxy-minted API, retrying once with a forced
-     * material refresh when the site rotated its material. Any other failure
-     * returns null so callers fall back to WebView.
-     */
-    private fun <T> withProxy(block: () -> T): T? {
-        val proxy = proxyServer() ?: return null
-        return try {
-            block()
-        } catch (e: CipherRotatedException) {
-            refreshProxyMaterial(proxy)
-            try {
-                block()
-            } catch (e2: Exception) {
-                null
-            }
-        } catch (e: Exception) {
-            null
-        }
-    }
-
-    /**
-     * Executes a proxy-backed signed call: ensures material is loaded, mints
-     * the token via `/sign`, builds the URL with the same canonical param
-     * ordering, and retries once with a forced cookie refresh when the server
-     * answers with a challenge.
-     */
-    private fun executeSignedViaProxy(proxy: String, path: String, params: Map<String, List<String>>): Response {
-        if (!ensureProxyMaterial(proxy)) {
-            throw Exception("Proxy material not available")
-        }
-        val sign = proxySign(proxy, path, params)
-            ?: throw Exception("Proxy sign failed")
-        var response = client.newCall(signedRequest(path, params, sign.token)).execute()
-        if (response.isApiChallenge()) {
-            response.close()
-            val refreshed = proxySign(proxy, path, params, forceRefresh = true)
-                ?: throw Exception("Proxy sign refresh failed")
-            response = client.newCall(signedRequest(path, params, refreshed.token)).execute()
-        }
-        return response
-    }
-
-    private fun Response.isApiChallenge(): Boolean {
-        val body = peekBody(CHALLENGE_PEEK_BYTES).string()
-        return body.contains("captcha_required") ||
-            body.contains("Security check") ||
-            body.contains("id=\"stage\"") ||
-            body.contains("Just a moment") ||
-            body.contains("cf-chl") ||
-            body.contains("<html", ignoreCase = true)
-    }
-
-    /** Builds the signed request using a pre-minted [token]. */
-    private fun signedRequest(
-        path: String,
-        params: Map<String, List<String>>,
-        token: String,
-    ): Request {
-        val builder = baseUrl.toHttpUrl().newBuilder()
-            .addPathSegments(path.trimStart('/'))
-        canonicalEntries(params).forEach { (name, value) -> builder.addQueryParameter(name, value) }
-        builder.addQueryParameter("_", token)
-        return GET(builder.build(), headers)
-    }
-
-    private fun responseBodyOrThrow(response: Response): String {
-        val body = response.body.string()
-        response.close()
-        if (response.code == 403 &&
-            (
-                body.contains("Invalid token", ignoreCase = true) ||
-                    body.contains("Missing token", ignoreCase = true)
-                )
-        ) {
-            throw CipherRotatedException(body.take(160))
-        }
-        if (!response.isSuccessful) {
-            throw Exception("API returned ${response.code}")
-        }
-        return decodeSignal(body)
-    }
-
-    /** Passes plaintext responses through; asks the proxy to decrypt an `"e"` envelope if present. */
-    private fun decodeSignal(body: String): String {
-        val root = runCatching { body.parseAs<JsonObject>() }.getOrNull()
-            ?: return body
-        val e = root["e"] as? JsonPrimitive ?: return body
-        return proxyServer()?.let { proxyDecrypt(it, e.content) }
-            ?: throw CipherRotatedException("decrypt failed")
-    }
+// ====================== API through the proxy =========================
+    // The /api/v1/* endpoints need a `_` token the site's bundle mints, and answer with an
+    // `{"e": ...}` envelope the same bundle unwraps. The client also sits behind Turnstile,
+    // whose clearance cannot be obtained off-device. So the call is made through the proxy,
+    // which owns the bundle: it signs, carries the cleared cookies and returns plain JSON.
+    //
+    // A null result means "unavailable", and every caller turns that into a clear error
+    // rather than a silent empty list.
 
     override fun getFilterList(data: JsonElement?) = sourceFilters().getFilterList()
 
@@ -1080,39 +621,9 @@ abstract class Comix :
         path: String,
         params: Map<String, List<String>>,
     ): T? {
-        val proxy = proxyServer()
-        if (proxy != null) {
-            val body = withProxy {
-                responseBodyOrThrow(executeSignedViaProxy(proxy, path, params))
-            } ?: return null
-            return body.parseAs<T>()
-        }
-        val currentCipher = cipher ?: return null
-        return runCatching {
-            val entries = canonicalEntries(params)
-            val query = entries.joinToString("&") { (name, value) ->
-                "$name=${encodeURIComponent(value)}"
-            }
-            val url = baseUrl.toHttpUrl().newBuilder()
-                .addPathSegments(path.trimStart('/'))
-                .apply {
-                    entries.forEach { (name, value) -> addQueryParameter(name, value) }
-                    addQueryParameter("_", currentCipher.sign(path, query))
-                }
-                .build()
-            val response = client.get(url)
-
-            val root = response.parseAs<JsonElement>()
-            val decoded = if (root is JsonObject && "e" in root) {
-                currentCipher.decrypt(root.parseAs<EncryptedResponse>().e).parseAs()
-            } else {
-                root
-            }
-            decoded.parseAs<T>()
-        }.getOrElse {
-            if (cipher === currentCipher) cipher = null
-            null
-        }
+        val proxy = proxyServer() ?: return null
+        val body = proxyRequest(proxy, path, params) ?: return null
+        return runCatching { body.parseAs<T>() }.getOrNull()
     }
 
     private fun canonicalEntries(params: Map<String, List<String>>): List<Pair<String, String>> = buildList {
@@ -1126,133 +637,17 @@ abstract class Comix :
         }
     }
 
-    private fun encodeURIComponent(value: String): String = buildString {
-        value.toByteArray().forEach { byte ->
-            val char = byte.toInt() and 0xff
-            if (
-                char in 'A'.code..'Z'.code || char in 'a'.code..'z'.code ||
-                char in '0'.code..'9'.code || char.toChar() in URI_COMPONENT_SAFE_CHARS
-            ) {
-                append(char.toChar())
-            } else {
-                append('%')
-                append(HEX[char ushr 4])
-                append(HEX[char and 0x0f])
-            }
-        }
-    }
-
-    private suspend fun runInWebView(
-        document: Document,
-        initializationScript: String? = null,
-        buildScript: (passPayloadName: String, rejectName: String) -> String,
-    ): String {
-        runCatching {
-            storedWafCookie()?.let { CookieManager.getInstance().setCookie(baseUrl, it) }
-        }
-        val timeoutDeadline = AtomicLong(
-            System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds,
-        )
-        val (bridgeName, errorBridgeName, passPayloadName, rejectName) = List(4) {
-            (1..(10..20).random())
-                .map { (('a'..'z') + ('A'..'Z')).random() }
-                .joinToString("")
-        }
-        val result = runWebView<String>(timeout = Duration.INFINITE) {
-            userAgent = headers["User-Agent"].orEmpty()
-            blockImages = true
-
-            val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
-            interceptRequest { request ->
-                val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
-                    ?: return@interceptRequest emptyResponse
-                val sourceHost = baseUrl.toHttpUrl().host
-                if (requestUrl.isChapterListRequest()) {
-                    timeoutDeadline.set(
-                        System.nanoTime() + WEBVIEW_TIMEOUT_SECONDS.seconds.inWholeNanoseconds,
-                    )
-                }
-                val allowed = requestUrl.host == sourceHost ||
-                    requestUrl.host.endsWith(".$sourceHost") ||
-                    requestUrl.host == "comix.to" ||
-                    requestUrl.host.endsWith(".comix.to") ||
-                    requestUrl.host == "comix.ws" ||
-                    requestUrl.host.endsWith(".comix.ws") ||
-                    requestUrl.host == "challenges.cloudflare.com"
-                if (allowed) null else emptyResponse
-            }
-
-            jsBridge(bridgeName) { resolve(it) }
-            jsBridge(errorBridgeName) { reject(Exception(it)) }
-
-            val captureScript = buildScript(passPayloadName, rejectName)
-            onPageStarted { evaluateJs(captureScript) }
-            onPageFinished { evaluateJs(captureScript) }
-            poll(SCRIPT_RETRY_INTERVAL_MS.milliseconds) {
-                if (
-                    System.nanoTime() >= timeoutDeadline.get()
-                ) {
-                    reject(Exception("Timed out waiting for WebView"))
-                } else {
-                    evaluateJs(captureScript)
-                }
-            }
-
-            val bootstrapScript = """
-                (function () {
-                    const captures = window.__comixCipherCaptures = [];
-                    const originalAtob = window.atob.bind(window);
-                    window.atob = function (value) {
-                        const decoded = originalAtob(value);
-                        try {
-                            const bytes = Array.from(decoded, char => char.charCodeAt(0) & 255);
-                            if (bytes.length === 256 || bytes.length === 24 || bytes.length === 32) {
-                                captures.push(bytes);
-                            }
-                        } catch (e) {}
-                        return decoded;
-                    };
-                    window.$passPayloadName = function (payload) {
-                        const sboxes = captures.filter(item => item.length === 256).slice(0, 3);
-                        const keys = captures.filter(item => item.length === 24 || item.length === 32).slice(0, 3);
-                        const material = sboxes.length === 3 && keys.length === 3
-                            ? { sboxes, keys }
-                            : null;
-                        window.$bridgeName.post(JSON.stringify({ payload, material }));
-                    };
-                    window.$rejectName = function (error) {
-                        window.$errorBridgeName.post(String(error?.message || error));
-                    };
-                })();
-                ${initializationScript.orEmpty()}
-            """.trimIndent()
-            val html = document.clone().apply {
-                head().prependElement("script").append(bootstrapScript)
-            }.outerHtml()
-            loadData(document.location(), html)
-        }.parseAs<WebViewCapture>()
-
-        result.material?.takeIf(CipherMaterial::isValid)?.let {
-            cipher = ComixCipher(it)
-        }
-        return result.payload
-    }
-
-    private fun HttpUrl.isChapterListRequest(): Boolean = pathSegments.size == 5 &&
-        pathSegments[0] == "api" &&
-        pathSegments[1] == "v1" &&
-        pathSegments[2] == "manga" &&
-        pathSegments[4] == "chapters"
-
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         EditTextPreference(screen.context).apply {
             key = PREF_PROXY_SERVER
             title = "Proxy server (comix-proxy)"
-            summary = "Base URL of a comix-proxy instance that mints signed tokens " +
-                "and solves the site's WAF/Cloudflare challenges (e.g. " +
-                "http://192.168.1.10:9191). Leave empty to use the built-in solver."
+            summary = "Base URL of a comix-proxy instance. It makes the API calls for you: " +
+                "the site answers API requests with a signed token and encrypted bodies and " +
+                "gates clients with Turnstile, neither of which can be reproduced off-device " +
+                "(e.g. http://192.168.1.10:9191). Required - without it no chapter, page or " +
+                "search list can be read."
             dialogTitle = "Proxy server URL"
-            setDefaultValue("")
+            setDefaultValue("http://127.0.0.1:9191")
         }.let(screen::addPreference)
 
         SwitchPreferenceCompat(screen.context).apply {
@@ -1424,20 +819,18 @@ abstract class Comix :
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
         private const val PREF_SHOW_TAGS_IN_GENRES = "pref_show_tags_in_genres"
         private const val PREF_SCORE_POSITION = "pref_score_position"
-        private const val PREF_WAF_COOKIE = "pref_waf_cookie"
         private const val PREF_PROXY_SERVER = "pref_proxy_server"
         private const val PREF_PROXY_COOKIE = "pref_proxy_cookie"
         private const val PREF_PROXY_USER_AGENT = "pref_proxy_user_agent"
 
         private const val DEFAULT_CONTENT_RATING = "suggestive"
-        private const val WAF_MAX_ATTEMPTS = 3
-        private const val WEBVIEW_TIMEOUT_SECONDS = 120L
-        private const val SCRIPT_RETRY_INTERVAL_MS = 100L
-        private const val MAX_CHAPTER_PAGES = 200
-        private const val HEX = "0123456789ABCDEF"
-        private const val URI_COMPONENT_SAFE_CHARS = "-_.!~*'()"
+
+        // Matches upstream. The site's own reader walks every page of a long title, and an
+        // 11k-chapter series is 569 pages at limit=20, so a lower cap silently truncates it -
+        // at 200 this stopped after 4,000 of 11,364 chapters.
+        private const val MAX_CHAPTER_PAGES = 1000
         private const val TAG_ID_CACHE_SIZE = 50
-        private const val CHALLENGE_PEEK_BYTES = 2048L
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
+        private const val ALT_HOSTS_FRAGMENT = "alt="
     }
 }

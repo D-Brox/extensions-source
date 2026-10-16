@@ -15,24 +15,6 @@ const val CHAPTER_ID_MEMO = "chapterId"
 const val CHAPTER_LIST_DEDUPLICATED_MEMO = "chapterListDeduplicated"
 
 @Serializable
-class WafChallengeResponse(
-    @SerialName("captcha_id") val captchaId: String,
-    @SerialName("image_base64") val imageBase64: String,
-    @SerialName("thumb_base64") val thumbBase64: String,
-)
-
-@Serializable
-class WafVerifyRequest(
-    @SerialName("captcha_id") val captchaId: String,
-    val angle: Int,
-)
-
-@Serializable
-class WafVerifyResponse(
-    val success: Boolean,
-)
-
-@Serializable
 class Term(
     val title: String,
 )
@@ -203,11 +185,6 @@ class Manga(
 }
 
 @Serializable
-class SingleMangaResponse(
-    val result: Manga,
-)
-
-@Serializable
 class Meta(
     val page: Int = 1,
     private val lastPage: Int = 1,
@@ -226,40 +203,34 @@ class Pagination(
     val actualLastPage: Int get() = maxOf(lastPage, lastPageOld)
 }
 
+/**
+ * Envelopes below are the API's shape, which is what `/api/v1` returns: the list and its
+ * paging sit at the top level. The site's own frontend instead serves the same data wrapped
+ * as `{status, result}`, which is what upstream parses because it reads the page's embedded
+ * query cache rather than the API.
+ */
+private fun lastPageOf(meta: Meta?, pagination: Pagination?): Boolean = when {
+    meta != null -> meta.page < meta.actualLastPage
+    pagination != null -> pagination.page < pagination.actualLastPage
+    else -> false
+}
+
 @Serializable
 class SearchResponse(
-    val result: Items,
+    val items: List<Manga> = emptyList(),
+    private val meta: Meta? = null,
+    private val pagination: Pagination? = null,
 ) {
-    @Serializable
-    class Items(
-        val items: List<Manga> = emptyList(),
-        private val meta: Meta? = null,
-        private val pagination: Pagination? = null,
-    ) {
-        fun hasNextPage(): Boolean = when {
-            meta != null -> meta.page < meta.actualLastPage
-            pagination != null -> pagination.page < pagination.actualLastPage
-            else -> false
-        }
-    }
+    fun hasNextPage(): Boolean = lastPageOf(meta, pagination)
 }
 
 @Serializable
 class ChapterDetailsResponse(
-    val result: Items,
+    val items: List<Chapter> = emptyList(),
+    private val meta: Meta? = null,
+    private val pagination: Pagination? = null,
 ) {
-    @Serializable
-    class Items(
-        val items: List<Chapter> = emptyList(),
-        private val meta: Meta? = null,
-        private val pagination: Pagination? = null,
-    ) {
-        fun hasNextPage(): Boolean = when {
-            meta != null -> meta.page < meta.actualLastPage
-            pagination != null -> pagination.page < pagination.actualLastPage
-            else -> false
-        }
-    }
+    fun hasNextPage(): Boolean = lastPageOf(meta, pagination)
 }
 
 @Serializable
@@ -332,18 +303,26 @@ class Chapter(
 
 @Serializable
 class ChapterResponse(
-    val result: ChapterResult,
+    val pages: Pages,
 ) {
     @Serializable
-    class ChapterResult(
-        val pages: Pages,
-    )
-
-    @Serializable
     class Pages(
-        val baseUrl: String,
+        // the API returns absolute image urls, so this is usually absent
+        val baseUrl: String = "",
         val items: List<PageDto>,
-    )
+        private val alt: List<String>? = null,
+        private val node: String? = null,
+    ) {
+        // Mirror hosts in the site reader's retry order, for when an image host is down.
+        fun altHosts(host: String, index: Int): List<String> {
+            if (alt.isNullOrEmpty()) return emptyList()
+            val label = host.substringBefore('.')
+            val start = index % alt.size
+            val domains = alt.drop(start) + alt.take(start)
+            val hosts = domains.map { "$label.$it" } + domains.map { "${node ?: label}.$it" }
+            return List(6) { hosts[it % hosts.size] }
+        }
+    }
 
     @Serializable
     class PageDto(
@@ -352,36 +331,35 @@ class ChapterResponse(
     )
 }
 
-/** Response of the comix-proxy `/sign` endpoint. */
+/** Response of the comix-proxy `/cookies` endpoint. */
 @Serializable
-class ProxySignResponse(
-    val token: String,
-    @SerialName("waf_pass") val wafPass: String,
+class ProxyCookiesResponse(
+    // The site used to hand out a `waf_pass` captcha cookie. Its @waf/generate endpoint now
+    // answers 500 and never issues a challenge, so the proxy no longer returns one and
+    // nothing needs it.
     @SerialName("cf_clearance") val cfClearance: String,
     @SerialName("user_agent") val userAgent: String,
-    // The proxy's whole cookie jar. The site also sets a session cookie, and sending
+    // The proxy's whole cookie jar; the site also sets a session cookie, and sending
     // cf_clearance on its own leaves every request on Cloudflare's challenge page.
     val cookie: String? = null,
 )
 
-/** Response of the comix-proxy `/cookies` endpoint. */
+/**
+ * Request body of the comix-proxy `/request` endpoint. `qs` is the canonical query the site
+ * itself would produce (keys sorted, `key[i]` arrays expanded, values unescaped).
+ */
 @Serializable
-class ProxyCookiesResponse(
-    @SerialName("waf_pass") val wafPass: String,
-    @SerialName("cf_clearance") val cfClearance: String,
-    @SerialName("user_agent") val userAgent: String,
-    // The proxy's whole cookie jar; see ProxySignResponse.cookie
-    val cookie: String? = null,
+class ProxyRequestBody(
+    val path: String,
+    val qs: String,
 )
 
-/** Response of the comix-proxy `/decrypt` endpoint. */
+/**
+ * Response of the comix-proxy `/request` endpoint: the API body as plain JSON. The proxy
+ * signs the request and unwraps the site's `{"e": ...}` envelope, so the extension never
+ * sees a token or ciphertext.
+ */
 @Serializable
-class ProxyDecryptResponse(
+class ProxyRequestResponse(
     val json: String,
-)
-
-/** Request body of the comix-proxy `/decrypt` endpoint. */
-@Serializable
-class ProxyDecryptRequest(
-    val e: String,
 )
